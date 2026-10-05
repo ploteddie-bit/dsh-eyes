@@ -3,7 +3,7 @@
   "name": "DSH Eyes",
   "version": "0.1.0",
   "description": "Vigil de navigation + mains du navigateur pour le harnais DSH (modèle webbridge, REWORK 2026-10-05).",
-  "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms"],
+  "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms", "tabGroups"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" }
 }

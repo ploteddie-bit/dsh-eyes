@@ -704,6 +704,38 @@ async fn v2_page_captcha(
     }
 }
 
+// ── Task « persistance » : groupe d'onglets nommé ──────────────────────
+
+/// Corps de `POST /v2/page/group {"tab_id"?,"title","color"?}`.
+#[derive(Debug, Deserialize)]
+pub struct TabGroupRequest {
+    pub tab_id: Option<i64>,
+    pub title: Option<String>,
+    pub color: Option<String>,
+}
+
+/// Handler `POST /v2/page/group` — place un onglet dans un groupe nommé
+/// (créé à la volée). Délègue à la commande extension `tab_group`.
+async fn v2_page_group(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<TabGroupRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let title = match req.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_title"),
+    };
+    let mut params = json!({ "tab_id": req.tab_id, "title": title });
+    if let Some(c) = req.color.as_deref() {
+        params["color"] = json!(c);
+    }
+    log_action("tab_group", params.clone());
+    match send_cmd(&channel, "tab_group", params).await {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 /// Extrait le host (schéma + autorité) d'une URL `http://host[:port]/…`
 /// ou `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
 ///
@@ -742,6 +774,7 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
         .route("/wait", post(v2_wait))
         .route("/page/screenshot", post(v2_page_screenshot))
         .route("/page/captcha", post(v2_page_captcha))
+        .route("/page/group", post(v2_page_group))
         // Task 7 : solveur de captcha. Le brief spécifiait
         // `/v2/page/{id}/solve` mais le `{id}` n'est pas utilisé (le
         // `tab_id` du body est prioritaire). En axum 0.7 + matchit,

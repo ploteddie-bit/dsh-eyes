@@ -352,6 +352,8 @@ async function dispatchCommand(cmd, params) {
       return cmdFill(params);
     case "wait":
       return cmdWait(params);
+    case "tab_group":
+      return cmdTabGroup(params);
     case "screenshot":
       return cmdScreenshot(params);
     case "captcha_detect":
@@ -525,6 +527,25 @@ async function cmdWait({ tab_id, selector, timeout_ms }) {
   throw new Error(
     `wait_timeout: '${selector}' introuvable après ${tmo} ms`,
   );
+}
+
+/**
+ * Place un onglet dans un groupe d'onglets nommé (Task « persistance »).
+ * Crée le groupe si nécessaire (chrome.tabs.group sans groupId → nouveau
+ * groupe), puis le nomme/colore via chrome.tabGroups.update.
+ * Params: `{tab_id?, title?, color?}` — tab_id absent = onglet actif.
+ * Retourne `{tab_id, group_id, title}`.
+ */
+async function cmdTabGroup({ tab_id, title, color }) {
+  if (typeof title !== "string" || !title) {
+    throw new Error("tab_group: 'title' (string) requis");
+  }
+  const real_tab_id = await resolveTabId(tab_id);
+  const group_id = await chrome.tabs.group({ tabIds: [real_tab_id] });
+  const update = { title };
+  if (typeof color === "string" && color) update.color = color;
+  await chrome.tabGroups.update(group_id, update);
+  return { tab_id: real_tab_id, group_id, title };
 }
 
 /**
