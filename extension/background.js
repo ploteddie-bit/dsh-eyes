@@ -154,7 +154,10 @@ function connect() {
 function buildEvent(details) {
   let host = "";
   try {
-    host = new URL(details.url).host;
+    // hostname (sans port) et non host : « 127.0.0.1:8445 » doit rester
+    // parsable comme IP par le vigil côté démon, sinon la règle
+    // localhost_access est contournée dès qu'un port est explicite.
+    host = new URL(details.url).hostname;
   } catch (_) {
     return null; // URL malformée : on laisse tomber (cas rarissime).
   }
