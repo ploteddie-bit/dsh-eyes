@@ -33,9 +33,10 @@ async fn ws_accepte_un_evenement_valide() {
         .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
 
-    // Construit le router complet (avec /health et /ws) et spawn le serveur.
-    // Task 3 : `api::router` prend maintenant un `Counters` partagé.
-    let app = dsh_eyes::api::router(dsh_eyes::stats::Counters::new());
+    // Construit le router complet (avec /health, /ws, /stats, /events) et
+    // spawn le serveur. Task 4 : `api::router` prend un `VigilCtx` agrégé.
+    // On n'a pas besoin d'allowlist / session pour ce test — valeurs par défaut.
+    let app = dsh_eyes::api::router(dsh_eyes::state::VigilCtx::new());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });

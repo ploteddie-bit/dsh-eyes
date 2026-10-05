@@ -18,14 +18,20 @@
 //!   "total_bytes":    12345
 //! }
 //! ```
+//!
+//! Task 4 : la récupération des compteurs passe par `Extension<VigilCtx>`
+//! (cf. `state.rs`) — on n'utilise plus un `State<Counters>` direct, mais
+//! l'API publique `Counters` reste inchangée.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json, Router};
+use axum::{extract::Extension, http::StatusCode, response::IntoResponse, Json, Router};
 use serde::Serialize;
 use std::{
     collections::HashMap,
     sync::Arc,
 };
 use tokio::sync::RwLock;
+
+use crate::state::VigilCtx;
 
 /// Compteurs agrégés pour un domaine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -76,8 +82,8 @@ struct StatsResponse {
 }
 
 /// Handler `GET /stats`.
-async fn stats_handler(State(counters): State<Counters>) -> impl IntoResponse {
-    let snap = counters.snapshot_async().await;
+async fn stats_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoResponse {
+    let snap = ctx.counters.snapshot_async().await;
     let total_requests: u64 = snap.values().map(|c| c.requests).sum();
     let total_bytes: u64 = snap.values().map(|c| c.bytes).sum();
     let body = StatsResponse {
@@ -88,9 +94,8 @@ async fn stats_handler(State(counters): State<Counters>) -> impl IntoResponse {
     (StatusCode::OK, Json(body))
 }
 
-/// Sous-router `/stats`. Le `Counters` est propagé comme `State` axum.
-pub fn stats_router(counters: Counters) -> Router {
-    Router::new()
-        .route("/stats", axum::routing::get(stats_handler))
-        .with_state(counters)
+/// Sous-router `/stats`. Ne pose plus de `with_state` — l'état est fourni
+/// par le router racine via `Extension<VigilCtx>` (cf. `api::router`).
+pub fn stats_router() -> Router {
+    Router::new().route("/stats", axum::routing::get(stats_handler))
 }

@@ -12,7 +12,9 @@
 //! L'ordre des tests `cargo test` n'étant pas garanti, cette approche est
 //! robuste.
 
+use dsh_eyes::state::VigilCtx;
 use dsh_eyes::stats::{Counters, DomainCounters};
+use dsh_eyes::vigil::Allowlist;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::time::Duration;
@@ -32,8 +34,13 @@ async fn stats_reflete_les_evenements_ws() {
         .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
 
-    // Router complet, câblé avec les compteurs.
-    let app = dsh_eyes::api::router(counters.clone());
+    // Router complet, câblé avec le contexte agrégé. Task 4 : `api::router`
+    // prend un `VigilCtx` ; on injecte directement les compteurs via
+    // `for_tests` (allowlist vide, session vide).
+    let app = dsh_eyes::api::router(VigilCtx::for_tests(
+        counters.clone(),
+        Allowlist::empty(),
+    ));
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });
@@ -108,7 +115,10 @@ async fn stats_snapshot_vide_quand_rien_ne_passe() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let app = dsh_eyes::api::router(counters.clone());
+    let app = dsh_eyes::api::router(VigilCtx::for_tests(
+        counters.clone(),
+        Allowlist::empty(),
+    ));
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });
