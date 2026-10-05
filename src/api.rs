@@ -41,6 +41,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::auth::{require_token, AuthToken};
@@ -225,6 +226,19 @@ pub(crate) fn error_response(status: StatusCode, error: impl Into<String>) -> Re
 ///
 /// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd","detail":{…}}`
 fn log_action(action: &str, detail: Value) {
+    // Chemin capturé UNE SEULE FOIS au premier log (OnceLock process-wide) :
+    // les tests qui modifient DSH_EYES_HOME en parallèle ne font plus
+    // varier le dossier entre le moment de l'appel et l'écriture async.
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        std::env::var_os("DSH_EYES_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".dsh-eyes"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".dsh-eyes"))
+            })
+    });
     let line = serde_json::json!({
         "ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -233,15 +247,8 @@ fn log_action(action: &str, detail: Value) {
         "action": action,
         "detail": detail,
     });
+    let path = home.join("actions.jsonl");
     tokio::spawn(async move {
-        let home = std::env::var_os("DSH_EYES_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".dsh-eyes"))
-                    .unwrap_or_else(|| std::path::PathBuf::from(".dsh-eyes"))
-            });
-        let path = home.join("actions.jsonl");
         let _ = tokio::fs::create_dir_all(&home).await;
         match tokio::fs::OpenOptions::new()
             .create(true)
