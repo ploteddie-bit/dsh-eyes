@@ -189,6 +189,11 @@ async fn send_cmd(
             ))
         }
         Err(CommandError::ExtensionError(msg)) => {
+            // Sélecteur introuvable → 404 (ressource ciblée inexistante),
+            // les autres erreurs extension restent en 502.
+            if msg.starts_with("sélecteur introuvable") {
+                return Err(error_response(StatusCode::NOT_FOUND, msg));
+            }
             tracing::warn!(error = %msg, "send_cmd : l'extension a renvoyé ok=false");
             Err(error_response(StatusCode::BAD_GATEWAY, msg))
         }
@@ -368,6 +373,115 @@ async fn v2_read(
     }
 }
 
+// ── Task 4 : actions goto / click / fill / wait ─────────────────────────
+// Endpoints de commodité qui enveloppent `send_cmd` (modèle webbridge),
+// mêmes motifs que `v2_open`/`v2_read`.
+
+/// Corps de `POST /v2/goto {"url"}`.
+#[derive(Debug, Deserialize)]
+pub struct GotoRequest {
+    pub url: Option<String>,
+}
+
+/// Handler `POST /v2/goto` — même sémantique que `/v2/open` (la commande
+/// extension `goto` fait `chrome.tabs.create`) ; garde-fou identique.
+async fn v2_goto(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<GotoRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let url = match req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_url"),
+    };
+    let host = match extract_host(url) {
+        Some(h) => h,
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid_url"),
+    };
+    if vigil::is_forbidden_host(&host) {
+        tracing::warn!(host = %host, "/v2/goto : hôte interdit");
+        return error_response(StatusCode::FORBIDDEN, "forbidden_target");
+    }
+    let params = json!({ "url": url, "active": true });
+    match send_cmd(&channel, "goto", params).await {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result" : result }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Corps de `POST /v2/click {"tab_id"?,"selector"}`.
+#[derive(Debug, Deserialize)]
+pub struct ClickRequest {
+    pub tab_id: Option<i64>,
+    pub selector: Option<String>,
+}
+
+async fn v2_click(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<ClickRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let selector = match req.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
+    };
+    let params = json!({ "tab_id": req.tab_id, "selector": selector });
+    match send_cmd(&channel, "click", params).await {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Corps de `POST /v2/fill {"tab_id"?,"selector","value"}`.
+#[derive(Debug, Deserialize)]
+pub struct FillRequest {
+    pub tab_id: Option<i64>,
+    pub selector: Option<String>,
+    pub value: Option<String>,
+}
+
+async fn v2_fill(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<FillRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let selector = match req.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
+    };
+    let value = req.value.unwrap_or_default();
+    let params = json!({ "tab_id": req.tab_id, "selector": selector, "value": value });
+    match send_cmd(&channel, "fill", params).await {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Corps de `POST /v2/wait {"tab_id"?,"selector","timeout_ms"?}` (plafond 10 s).
+#[derive(Debug, Deserialize)]
+pub struct WaitRequest {
+    pub tab_id: Option<i64>,
+    pub selector: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+async fn v2_wait(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<WaitRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let selector = match req.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
+    };
+    // Plafond 10 s : jamais au-delà, même si le client demande plus.
+    let timeout_ms = req.timeout_ms.unwrap_or(5000).min(10_000);
+    let params = json!({ "tab_id": req.tab_id, "selector": selector, "timeout_ms": timeout_ms });
+    match send_cmd(&channel, "wait", params).await {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
+        Err(resp) => resp,
+    }
+}
 /// Extrait le host (schéma + autorité) d'une URL `http://host[:port]/…`
 /// ou `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
 ///
@@ -400,6 +514,10 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
         .route("/cmd", post(v2_cmd))
         .route("/open", post(v2_open))
         .route("/read", post(v2_read))
+        .route("/goto", post(v2_goto))
+        .route("/click", post(v2_click))
+        .route("/fill", post(v2_fill))
+        .route("/wait", post(v2_wait))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
         .layer(Extension(channel))

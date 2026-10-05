@@ -250,9 +250,16 @@ chrome.webRequest.onCompleted.addListener(
 //   - "read" {tab_id, max_bytes?} : exécute un script qui retourne
 //     `document.body.innerText` (tronqué à `max_bytes` ou 200 Ko par
 //     défaut) ; retourne {text}.
-//   - "click" {tab_id, selector} : exécute `document.querySelector(sel).click()`.
-//   - "fill" {tab_id, selector, value} : exécute
+//   - "click" {tab_id?, selector} : exécute `document.querySelector(sel).click()`.
+//     Si `tab_id` est omis, prend l'onglet actif (`chrome.tabs.query`).
+//   - "fill" {tab_id?, selector, value} : exécute
 //     `(el.value = value, el.dispatchEvent(new Event('input', {bubbles:true})))`.
+//     `tab_id` optionnel (cf. click).
+//   - "wait" {tab_id?, selector, timeout_ms} : poll toutes les 100 ms
+//     `document.querySelector(sel)` jusqu'à ce qu'il renvoie non-null
+//     ou que `timeout_ms` soit écoulé. Format d'erreur stable :
+//     `"wait_timeout: '<sel>' introuvable après <N> ms"` — le démon
+//     peut le matcher pour un 504 dédié (cf. spec Task 4).
 //
 // Toutes les commandes sont enveloppées dans un timeout local de 25 s
 // (légèrement en deçà du timeout serveur de 30 s pour éviter les races).
@@ -314,6 +321,8 @@ async function dispatchCommand(cmd, params) {
       return cmdClick(params);
     case "fill":
       return cmdFill(params);
+    case "wait":
+      return cmdWait(params);
     default:
       throw new Error(`commande inconnue: ${cmd}`);
   }
@@ -366,20 +375,35 @@ async function cmdRead({ tab_id, max_bytes }) {
   return { text };
 }
 
+/**
+ * Résout un `tab_id` optionnel. Si `tab_id` est null/undefined, prend
+ * l'onglet actif de la fenêtre courante. Factorisé pour click/fill/wait
+ * — chaque endpoint peut donc être appelé après un `goto` sans connaître
+ * l'ID retourné.
+ */
+async function resolveTabId(tab_id) {
+  if (tab_id != null) return tab_id;
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs || tabs.length === 0) {
+    throw new Error("aucun onglet actif trouvé (et tab_id non fourni)");
+  }
+  return tabs[0].id;
+}
+
 /** Clique sur un élément via son sélecteur CSS. */
 async function cmdClick({ tab_id, selector }) {
-  if (tab_id == null) throw new Error("click: 'tab_id' requis");
   if (typeof selector !== "string" || !selector) {
     throw new Error("click: 'selector' (string) requis");
   }
+  const real_tab_id = await resolveTabId(tab_id);
   const injection = (sel) => {
     const el = document.querySelector(sel);
-    if (!el) throw new Error("element introuvable: " + sel);
+    if (!el) throw new Error("sélecteur introuvable: " + sel);
     el.click();
     return true;
   };
   await chrome.scripting.executeScript({
-    target: { tabId: tab_id },
+    target: { tabId: real_tab_id },
     func: injection,
     args: [selector],
   });
@@ -388,16 +412,16 @@ async function cmdClick({ tab_id, selector }) {
 
 /** Remplit un input/textarea et déclenche l'event `input`. */
 async function cmdFill({ tab_id, selector, value }) {
-  if (tab_id == null) throw new Error("fill: 'tab_id' requis");
   if (typeof selector !== "string" || !selector) {
     throw new Error("fill: 'selector' (string) requis");
   }
   if (typeof value !== "string") {
     throw new Error("fill: 'value' (string) requis");
   }
+  const real_tab_id = await resolveTabId(tab_id);
   const injection = (sel, val) => {
     const el = document.querySelector(sel);
-    if (!el) throw new Error("element introuvable: " + sel);
+    if (!el) throw new Error("sélecteur introuvable: " + sel);
     el.focus();
     el.value = val;
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -405,11 +429,69 @@ async function cmdFill({ tab_id, selector, value }) {
     return true;
   };
   await chrome.scripting.executeScript({
-    target: { tabId: tab_id },
+    target: { tabId: real_tab_id },
     func: injection,
     args: [selector, value],
   });
   return { filled: selector, length: value.length };
+}
+
+/**
+ * Attend qu'un élément apparaisse dans le DOM (sélecteur CSS).
+ *
+ * Polling côté service worker : un `executeScript` toutes les
+ * `WAIT_POLL_MS` (100 ms) jusqu'à ce que `document.querySelector(sel)`
+ * renvoie non-null OU que `timeout_ms` soit écoulé. On borne le timeout
+ * côté handler à 10 s (cf. brief Task 4) — au-delà on rejette avec une
+ * erreur explicite plutôt que de laisser le `COMMAND_TIMEOUT_MS` (25 s)
+ * global arbitrer. Le résultat est `{found, selector, elapsed_ms}`.
+ *
+ * Si `tab_id` est omis, on travaille sur l'onglet actif via
+ * `chrome.tabs.query({active:true,currentWindow:true})`. Ça permet à
+ * `POST /v2/wait` d'être appelé juste après un `goto` sans connaître
+ * l'ID.
+ */
+const WAIT_POLL_MS = 100;
+const WAIT_TIMEOUT_MAX_MS = 10_000;
+
+async function cmdWait({ tab_id, selector, timeout_ms }) {
+  if (typeof selector !== "string" || !selector) {
+    throw new Error("wait: 'selector' (string) requis");
+  }
+  const tmo = Number.isFinite(timeout_ms) ? Math.floor(timeout_ms) : 5000;
+  if (tmo < 0) {
+    throw new Error("wait: 'timeout_ms' doit être >= 0");
+  }
+  if (tmo > WAIT_TIMEOUT_MAX_MS) {
+    throw new Error(`wait: 'timeout_ms' > ${WAIT_TIMEOUT_MAX_MS} non supporté`);
+  }
+
+  // Résout le tab_id si absent (helper partagé avec click/fill).
+  const real_tab_id = await resolveTabId(tab_id);
+
+  const start = Date.now();
+  const deadline = start + tmo;
+  const injection = (sel) => Boolean(document.querySelector(sel));
+  while (Date.now() < deadline) {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: real_tab_id },
+      func: injection,
+      args: [selector],
+    });
+    if (Array.isArray(results) && results.length > 0 && results[0].result === true) {
+      return {
+        found: true,
+        selector,
+        elapsed_ms: Date.now() - start,
+      };
+    }
+    await new Promise((r) => setTimeout(r, WAIT_POLL_MS));
+  }
+  // Timeout écoulé : on signale une erreur typée pour que le handler
+  // Rust puisse mapper en 504 (cf. `send_cmd`).
+  throw new Error(
+    `wait_timeout: '${selector}' introuvable après ${tmo} ms`,
+  );
 }
 
 /**
