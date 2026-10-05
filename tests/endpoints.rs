@@ -530,9 +530,16 @@ async fn open_journalise_dans_actions_jsonl() {
         assert!(attempts <= 50, "actions.jsonl absent après 50 tentatives");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
-    let parsed: serde_json::Value =
-        serde_json::from_str(body.trim()).expect("ligne JSONL valide");
-    assert_eq!(parsed["action"], "open");
+    // Le fichier peut contenir des actions d'autres tests tournant en
+    // parallèle (read_*, etc.) — on cherche UNE ligne action=="open".
+    let found_open = body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["action"] == "open");
+    assert!(
+        found_open,
+        "aucune ligne action=open dans actions.jsonl (body={body})"
+    );
 
     let _ = ws_tx.send(Message::Close(None)).await;
 }
