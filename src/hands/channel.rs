@@ -297,9 +297,15 @@ impl ExtensionChannel {
                 if resp.ok {
                     Ok(resp)
                 } else {
-                    Err(CommandError::ExtensionError(
-                        resp.error.unwrap_or_else(|| "(no error message)".into()),
-                    ))
+                    // ok:false sans message : erreur de protocole extension,
+                    // pas une erreur métier — nommée explicitement plutôt
+                    // que masquée par un fallback générique.
+                    match resp.error {
+                        Some(err) => Err(CommandError::ExtensionError(err)),
+                        None => Err(CommandError::ExtensionError(
+                            "extension_protocol_error: ok=false sans message".into(),
+                        )),
+                    }
                 }
             }
         }

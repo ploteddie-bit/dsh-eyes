@@ -257,6 +257,35 @@ fn is_private_rfc1918(ip: &IpAddr) -> bool {
     }
 }
 
+/// Garde-fou partagé (Task 3, REWORK webbridge) : dit si un hôte / URL
+/// pointe vers une cible interdite (loopback, RFC1918, nom `localhost`).
+///
+/// Utilisé par `POST /v2/open` pour refuser en 403 les ouvertures vers
+/// les ressources locales du poste (l'extension DSH Eyes observe déjà
+/// ce trafic via `chrome.webRequest`, pas besoin de l'orchestrer depuis
+/// l'API). Mutualise `is_loopback` et `is_private_rfc1918` qui étaient
+/// jusque-là privées au module `vigil`.
+///
+/// Sémantique :
+/// - Le nom `localhost` (insensible à la casse) → interdit.
+/// - Une IP parseable en `127.0.0.0/8` ou `::1` → interdite.
+/// - Une IP parseable en RFC1918 (10/8, 192.168/16, 172.16/12) → interdite.
+/// - Tout autre chaîne (domaine public, IP publique, IPv6 non-loopback) → autorisé.
+///
+/// Note : on **ne fait pas** de résolution DNS ici (impossible sans
+/// bloquer). Un attaquant peut donc inscrire `127.0.0.1.nip.io` —
+/// c'est le rôle du vigil de notifier `new_domain`. Cette fonction ne
+/// vise que les cibles manifestement privées.
+pub fn is_forbidden_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_loopback(&ip) || is_private_rfc1918(&ip);
+    }
+    false
+}
+
 /// Calcule le chemin de `allowlist.json` (même logique que `events.jsonl` —
 /// `DSH_EYES_HOME` ou `~/.dsh-eyes/`). Ne crée pas le dossier.
 fn allowlist_path() -> std::io::Result<std::path::PathBuf> {
