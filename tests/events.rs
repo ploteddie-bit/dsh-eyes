@@ -20,10 +20,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+mod common;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+// Le MutexGuard couvre tout le test (qui contient des `await` partout) : c'est
+// volontaire, on veut sérialiser tout le test pour ne pas marcher sur DSH_EYES_HOME.
+#[allow(clippy::await_holding_lock)]
 async fn events_reflete_les_alertes_ws() {
+    // Sérialise l'accès à DSH_EYES_HOME (env partagé du process de test).
+    let _guard = common::env_guard();
+
     // Dossier temporaire pour la persistance d'alertes.
     let tmp = tempdir_in_tests_target();
     std::env::set_var("DSH_EYES_HOME", &tmp);

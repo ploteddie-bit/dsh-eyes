@@ -17,11 +17,19 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+mod common;
+
 /// Petit timeout global pour éviter qu'un bug ne fasse tourner le test à l'infini.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+// Le MutexGuard couvre tout le test (qui contient des `await` partout) : c'est
+// volontaire, on veut sérialiser tout le test pour ne pas marcher sur DSH_EYES_HOME.
+#[allow(clippy::await_holding_lock)]
 async fn ws_accepte_un_evenement_valide() {
+    // Sérialise l'accès à DSH_EYES_HOME (env partagé du process de test).
+    let _guard = common::env_guard();
+
     // Dossier temporaire pour la persistance. On positionne la variable d'env AVANT
     // de binder le listener, pour que `ingest::ws_handler` lise la bonne valeur.
     let tmp = tempdir_in_tests_target();
