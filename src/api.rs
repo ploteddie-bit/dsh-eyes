@@ -9,16 +9,27 @@
 //!   gratuitement sans avoir à le re-passer.
 //! - Les sous-routers `ws_router()`, `stats_router()` ne posent plus
 //!   de `with_state` ; ils lisent l'extension.
+//!
+//! v2 (Task 1) :
+//! - `router_with_v2(ctx, config)` ajoute le sous-router `/v2` **monté
+//!   derrière** `auth::require_token`. Les routes v1 (`/health`, `/ws`,
+//!   `/stats`, `/events`) restent **inchangées et ouvertes**.
+//! - Le token est passé au middleware via `Extension(AuthToken(...))`.
+//! - `router(ctx)` reste intact pour la compat v1 (signature stable,
+//!   12 tests verts à préserver).
 
 use axum::{
     extract::Extension,
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::Serialize;
 
+use crate::auth::{require_token, AuthToken};
+use crate::config::Config;
 use crate::state::VigilCtx;
 use crate::vigil;
 
@@ -33,6 +44,25 @@ pub async fn health() -> Json<Health> {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+/// Handler `GET /v2/ping` — endpoint trivial pour tester l'auth.
+async fn v2_ping() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// Construit le sous-router `/v2` avec l'auth middleware appliqué.
+/// Le token attendu est transporté par `Extension(AuthToken(...))` posé
+/// sur ce sous-router (pas sur le router racine — ça reste confined à /v2).
+///
+/// Note : on utilise `nest("/v2", ...)` côté `router_with_v2`, donc ici
+/// le sous-router déclare juste `/ping` — le préfixe `/v2` est ajouté
+/// par le `nest` à la fusion.
+fn v2_router(token: String) -> Router {
+    Router::new()
+        .route("/ping", get(v2_ping))
+        .route_layer(middleware::from_fn(require_token))
+        .layer(Extension(AuthToken(token)))
 }
 
 /// Nombre max d'alertes servies par `/events` (cf. brief Task 4).
@@ -72,6 +102,7 @@ async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoRespons
 }
 
 /// Router principal — fusionne `/health`, `/ws`, `/stats`, `/events`.
+/// **Inchangé** (compat v1 stricte, 12 tests verts à préserver).
 pub fn router(ctx: VigilCtx) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -79,4 +110,14 @@ pub fn router(ctx: VigilCtx) -> Router {
         .merge(crate::ingest::ws_router())
         .merge(crate::stats::stats_router())
         .layer(Extension(ctx))
+}
+
+/// Router v1 + sous-router `/v2` protégé par `auth::require_token`.
+///
+/// Le token est passé via `Extension(AuthToken)` au sous-router /v2 ; le
+/// middleware le lit dans `request.extensions()`. Aucune route v1 n'est
+/// affectée (on utilise `nest` + `route_layer` qui confinent le middleware
+/// au sous-arbre /v2).
+pub fn router_with_v2(ctx: VigilCtx, config: Config) -> Router {
+    router(ctx).nest("/v2", v2_router(config.api_token().to_string()))
 }
