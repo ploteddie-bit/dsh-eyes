@@ -14,6 +14,9 @@ pub async fn health() -> Json<Health> {
     })
 }
 
+/// Router principal — fusionne `/health` et `/ws` (ingestion Task 2).
 pub fn router() -> Router {
-    Router::new().route("/health", get(health))
+    Router::new()
+        .route("/health", get(health))
+        .merge(crate::ingest::ws_router())
 }

@@ -1,4 +1,5 @@
 mod api;
+mod ingest;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
