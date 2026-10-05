@@ -41,6 +41,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt as _;
 
 use crate::auth::{require_token, AuthToken};
 use crate::config::Config;
@@ -212,6 +213,51 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Journalise une action v2 dans `actions.jsonl` (Task 5 — traçabilité
+/// « toute action est loggée »). Fire-and-forget : l'échec d'écriture est
+/// loggé mais ne fait jamais échouer l'action métier.
+///
+/// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd","detail":{…}}`
+fn log_action(action: &str, detail: Value) {
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        "action": action,
+        "detail": detail,
+    });
+    tokio::spawn(async move {
+        let home = std::env::var_os("DSH_EYES_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".dsh-eyes"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".dsh-eyes"))
+            });
+        let path = home.join("actions.jsonl");
+        let _ = tokio::fs::create_dir_all(&home).await;
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut f) => {
+                let mut buf = match serde_json::to_vec(&line) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                buf.push(b'\n');
+                if let Err(e) = f.write_all(&buf).await {
+                    tracing::warn!(error = %e, "log_action : écriture actions.jsonl échouée");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "log_action : ouverture actions.jsonl échouée"),
+        }
+    });
+}
+
 /// Handler `POST /v2/cmd` — modèle webbridge (REWORK).
 ///
 /// Flux :
@@ -222,6 +268,7 @@ async fn v2_cmd(
     Extension(channel): Extension<ExtensionChannel>,
     Json(req): Json<CmdRequest>,
 ) -> Response {
+    log_action(&req.cmd, req.params.clone());
     match send_cmd(&channel, req.cmd, req.params).await {
         Ok(result) => {
             let body = CmdResponse {
@@ -291,6 +338,7 @@ async fn v2_open(
     // (chrome.tabs.create defaults à active=true de toute façon, mais
     // c'est plus lisible).
     let params = json!({ "url": url, "active": true });
+    log_action("open", params.clone());
     match send_cmd(&channel, "tabs_create", params).await {
         Ok(result) => {
             let body = OpenResponse {
@@ -345,6 +393,7 @@ async fn v2_read(
         None => return error_response(StatusCode::BAD_REQUEST, "missing_tab_id"),
     };
     let params = json!({ "tab_id": tab_id });
+    log_action("read", params.clone());
     match send_cmd(&channel, "read", params).await {
         Ok(result) => {
             // L'extension renvoie `{text: "..."}`. Si la forme est
@@ -403,6 +452,7 @@ async fn v2_goto(
         return error_response(StatusCode::FORBIDDEN, "forbidden_target");
     }
     let params = json!({ "url": url, "active": true });
+    log_action("goto", params.clone());
     match send_cmd(&channel, "goto", params).await {
         Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result" : result }))).into_response(),
         Err(resp) => resp,
@@ -426,6 +476,7 @@ async fn v2_click(
         None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
     };
     let params = json!({ "tab_id": req.tab_id, "selector": selector });
+    log_action("click", params.clone());
     match send_cmd(&channel, "click", params).await {
         Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
         Err(resp) => resp,
@@ -451,6 +502,7 @@ async fn v2_fill(
     };
     let value = req.value.unwrap_or_default();
     let params = json!({ "tab_id": req.tab_id, "selector": selector, "value": value });
+    log_action("fill", params.clone());
     match send_cmd(&channel, "fill", params).await {
         Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
         Err(resp) => resp,
@@ -477,6 +529,7 @@ async fn v2_wait(
     // Plafond 10 s : jamais au-delà, même si le client demande plus.
     let timeout_ms = req.timeout_ms.unwrap_or(5000).min(10_000);
     let params = json!({ "tab_id": req.tab_id, "selector": selector, "timeout_ms": timeout_ms });
+    log_action("wait", params.clone());
     match send_cmd(&channel, "wait", params).await {
         Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
         Err(resp) => resp,

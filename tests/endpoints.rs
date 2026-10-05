@@ -491,3 +491,48 @@ async fn read_502_extension_renvoie_erreur() {
 
     let _ = ws_tx.send(Message::Close(None)).await;
 }
+/// Task 5 — toute action v2 est journalisée dans `actions.jsonl`.
+#[tokio::test]
+async fn open_journalise_dans_actions_jsonl() {
+    let (token, addr, channel) = start_server_with_token().await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+
+    let token2 = token.clone();
+    let post_task = tokio::spawn(async move {
+        post(
+            addr,
+            "/v2/open",
+            Some(&format!("Bearer {token2}")),
+            r#"{"url":"https://example.com"}"#,
+        )
+        .await
+    });
+
+    let cmd = read_command(&mut ws_rx).await;
+    let cmd_id = cmd["cmd_id"].as_u64().expect("cmd_id manquant");
+    send_response(&mut ws_tx, cmd_id, json!({ "tab_id": 7 })).await;
+
+    let (status, _body) = post_task.await.expect("post_task join");
+    assert_eq!(status, 200);
+
+    // Le démon doit avoir journalisé l'action (log_action → actions.jsonl
+    // dans $DSH_EYES_HOME, posé par le harnais).
+    let home = std::env::var("DSH_EYES_HOME").expect("DSH_EYES_HOME");
+    let path = std::path::Path::new(&home).join("actions.jsonl");
+    let mut attempts = 0u8;
+    let body = loop {
+        attempts += 1;
+        if let Ok(b) = std::fs::read_to_string(&path) {
+            if !b.is_empty() {
+                break b;
+            }
+        }
+        assert!(attempts <= 50, "actions.jsonl absent après 50 tentatives");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("ligne JSONL valide");
+    assert_eq!(parsed["action"], "open");
+
+    let _ = ws_tx.send(Message::Close(None)).await;
+}
