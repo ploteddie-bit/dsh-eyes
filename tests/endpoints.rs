@@ -516,9 +516,10 @@ async fn open_journalise_dans_actions_jsonl() {
     assert_eq!(status, 200);
 
     // Le démon doit avoir journalisé l'action (log_action → actions.jsonl
-    // dans $DSH_EYES_HOME, posé par le harnais).
-    let home = std::env::var("DSH_EYES_HOME").expect("DSH_EYES_HOME");
-    let path = std::path::Path::new(&home).join("actions.jsonl");
+    // dans $DSH_EYES_HOME, posé par le harnais. On lit le chemin via la
+    // même fonction que le démon (OnceLock partagée) — jamais l'env brut
+    // (un autre test pourrait l'avoir modifié entre-temps).
+    let path = dsh_eyes::api::actions_jsonl_path();
     let mut attempts = 0u8;
     let body = loop {
         attempts += 1;

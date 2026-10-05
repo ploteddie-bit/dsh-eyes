@@ -220,15 +220,10 @@ pub(crate) fn error_response(status: StatusCode, error: impl Into<String>) -> Re
     (status, Json(body)).into_response()
 }
 
-/// Journalise une action v2 dans `actions.jsonl` (Task 5 — traçabilité
-/// « toute action est loggée »). Fire-and-forget : l'échec d'écriture est
-/// loggé mais ne fait jamais échouer l'action métier.
-///
-/// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd","detail":{…}}`
-fn log_action(action: &str, detail: Value) {
-    // Chemin capturé UNE SEULE FOIS au premier log (OnceLock process-wide) :
-    // les tests qui modifient DSH_EYES_HOME en parallèle ne font plus
-    // varier le dossier entre le moment de l'appel et l'écriture async.
+/// Chemin du journal des actions — capturé UNE SEULE FOIS (OnceLock
+/// process-wide). Exposé pub pour que les tests lisent EXACTEMENT le
+/// même dossier que le démon, sans dépendre de l'env à l'instant T.
+pub fn actions_jsonl_path() -> PathBuf {
     static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let home = HOME.get_or_init(|| {
         std::env::var_os("DSH_EYES_HOME")
@@ -239,6 +234,20 @@ fn log_action(action: &str, detail: Value) {
                     .unwrap_or_else(|| std::path::PathBuf::from(".dsh-eyes"))
             })
     });
+    home.join("actions.jsonl")
+}
+
+/// Journalise une action v2 dans `actions.jsonl` (Task 5 — traçabilité
+/// « toute action est loggée »). Fire-and-forget : l'échec d'écriture est
+/// loggé mais ne fait jamais échouer l'action métier.
+///
+/// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd","detail":{…}}`
+fn log_action(action: &str, detail: Value) {
+    // Chemin capturé UNE SEULE FOIS au premier log (OnceLock process-wide) :
+    // les tests qui modifient DSH_EYES_HOME en parallèle ne font plus
+    // varier le dossier entre le moment de l'appel et l'écriture async.
+    let path = actions_jsonl_path();
+    let home = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let line = serde_json::json!({
         "ts": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -247,7 +256,6 @@ fn log_action(action: &str, detail: Value) {
         "action": action,
         "detail": detail,
     });
-    let path = home.join("actions.jsonl");
     tokio::spawn(async move {
         let _ = tokio::fs::create_dir_all(&home).await;
         match tokio::fs::OpenOptions::new()
