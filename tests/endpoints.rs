@@ -77,6 +77,7 @@ where
 }
 
 /// Lance le serveur (harnais identique à `tests/cmd.rs`).
+#[allow(clippy::await_holding_lock)]
 async fn start_server_with_token() -> (String, std::net::SocketAddr, ExtensionChannel) {
     let _guard = common::env_guard();
     let tmp = tempdir_in_tests_target();

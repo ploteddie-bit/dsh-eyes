@@ -11,29 +11,36 @@
 //! - Les sous-routers `ws_router()`, `stats_router()` ne posent plus
 //!   de `with_state` ; ils lisent l'extension.
 //!
-//! ## v2 (Task 1 → REWORK Task 2)
+//! ## v2 (Task 1 → REWORK Task 2 → Task 3)
 //!
 //! - `router_with_v2(ctx, config, channel)` ajoute le sous-router `/v2`
 //!   **monté derrière** `auth::require_token`. Les routes v1 (`/health`,
 //!   `/ws`, `/stats`, `/events`) restent **inchangées et ouvertes**.
 //! - Le token est passé au middleware via `Extension(AuthToken(...))`.
 //! - Le `ExtensionChannel` est passé via `Extension(ExtensionChannel)` à
-//!   `/v2/cmd` (POST) — le handler pousse la commande dans le canal et
-//!   attend la réponse de l'extension (modèle webbridge, REWORK Eddie
-//!   2026-10-05).
-//! - `router(ctx)` reste intact pour la compat v1 (signature stable,
-//!   12 tests verts à préserver).
+//!   `/v2/cmd` (POST, modèle webbridge brut) et à `/v2/open` +
+//!   `/v2/read` (Task 3, endpoints de commodité qui enveloppent `/v2/cmd`).
+//! - `router(ctx)` reste intact pour la compat v1 (signature stable).
+//!
+//! ## Task 3 — endpoints de commodité
+//!
+//! `POST /v2/open {"url"}` et `POST /v2/read {"tab_id"}` factorisent
+//! l'envoi de commandes au canal via la fonction privée [`send_cmd`]
+//! (commune à `v2_cmd`, `v2_open`, `v2_read`). Ça évite de dupliquer
+//! le `match` sur `CommandError` (5 variantes) à chaque handler. Le
+//! mapping d'erreur est unique, documenté en tête de `send_cmd`.
 
 use axum::{
-    extract::Extension,
+    extract::rejection::JsonRejection,
+    extract::{Extension, Request},
     http::StatusCode,
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::auth::{require_token, AuthToken};
 use crate::config::Config;
@@ -85,70 +92,305 @@ pub struct CmdResponse {
     pub error: Option<String>,
 }
 
+/// Erreur de parsing du `Json` body — on l'utilise comme
+/// `IntoResponse` pour renvoyer 400 (au lieu du 422 par défaut d'axum)
+/// et un message uniforme `{"ok":false,"error":"invalid_body"}`.
+/// On garde le détail dans `tracing::debug!` (pas en log warning :
+/// c'est du bruit côté serveur si un client mal-formé appelle en boucle).
+#[derive(Debug)]
+struct JsonBodyError(String);
+
+impl JsonBodyError {
+    fn from_rejection(e: JsonRejection) -> Self {
+        Self(e.body_text())
+    }
+}
+
+impl IntoResponse for JsonBodyError {
+    fn into_response(self) -> Response {
+        tracing::debug!(error = %self.0, "rejet Json body");
+        error_response(StatusCode::BAD_REQUEST, "invalid_body")
+    }
+}
+
+/// Extractor wrapper : `Json<T>` avec gestion custom de la rejection.
+/// Pattern recommandé par axum 0.7 (cf. docs.rs/axum/extract).
+///
+/// Usage : `body: ValidatedJson<MyRequest>` au lieu de `Json<MyRequest>`.
+/// Côté handler on déballe via `ValidatedJson(Json(req)) = body`.
+struct ValidatedJson<T>(Json<T>);
+
+#[axum::async_trait]
+impl<T, S> axum::extract::FromRequest<S> for ValidatedJson<T>
+where
+    T: serde::de::DeserializeOwned + 'static,
+    S: Send + Sync,
+    Json<T>: axum::extract::FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = JsonBodyError;
+
+    async fn from_request(
+        req: Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(j) => Ok(ValidatedJson(j)),
+            Err(e) => Err(JsonBodyError::from_rejection(e)),
+        }
+    }
+}
+
+/// Envoie une commande via le canal et traduit uniformément les erreurs
+/// en `Response` HTTP. **Point d'entrée unique** pour tous les handlers
+/// qui parlent à l'extension (`/v2/cmd`, `/v2/open`, `/v2/read`).
+///
+/// Mapping d'erreur (cf. tests/cmd.rs pour la matrice exacte) :
+/// - `Ok(Response)` → `Ok(resp.result)` (le caller fait son formatage).
+/// - `Err(NoExtension)` → 504 `no_extension_connected`.
+/// - `Err(Timeout(d))` → 504 `extension_timeout_Ns`.
+/// - `Err(ChannelClosed)` → 504 `extension_disconnected`.
+/// - `Err(ExtensionError(msg))` → 502 + `msg` propagé tel quel.
+///
+/// Le `Result<Value, Response>` permet au caller d'utiliser `?` ou un
+/// simple `match` pour composer sa réponse. Pas d'`unwrap`/panic : tous
+/// les chemins d'erreur renvoient une `Response` HTTP valide.
+async fn send_cmd(
+    channel: &ExtensionChannel,
+    cmd: impl Into<String>,
+    params: Value,
+) -> Result<Value, Response> {
+    match channel.send_command(cmd, params).await {
+        Ok(resp) => {
+            // resp.ok est toujours true ici (Channel mappe false → Err).
+            // resp.result est `Option<Value>` selon l'extension — on
+            // normalise en `Value::Null` si None (jamais observé mais
+            // on reste safe).
+            Ok(resp.result.unwrap_or(Value::Null))
+        }
+        Err(CommandError::NoExtension) => {
+            tracing::warn!("send_cmd : aucune extension connectée");
+            Err(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "no_extension_connected",
+            ))
+        }
+        Err(CommandError::Timeout(d)) => {
+            tracing::warn!(timeout = ?d, "send_cmd : timeout en attendant l'extension");
+            Err(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("extension_timeout_{}s", d.as_secs()),
+            ))
+        }
+        Err(CommandError::ChannelClosed) => {
+            tracing::warn!("send_cmd : canal oneshot fermé (extension déconnectée)");
+            Err(error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "extension_disconnected",
+            ))
+        }
+        Err(CommandError::ExtensionError(msg)) => {
+            tracing::warn!(error = %msg, "send_cmd : l'extension a renvoyé ok=false");
+            Err(error_response(StatusCode::BAD_GATEWAY, msg))
+        }
+    }
+}
+
+/// Helper : construit une `Response` JSON `{ok:false, error}` avec le
+/// statut donné. Utilisé par [`send_cmd`] et par les handlers qui
+/// retournent des erreurs 4xx (400 input invalide, 403 forbidden).
+fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
+    let body = CmdResponse {
+        ok: false,
+        result: None,
+        error: Some(error.into()),
+    };
+    (status, Json(body)).into_response()
+}
+
 /// Handler `POST /v2/cmd` — modèle webbridge (REWORK).
 ///
 /// Flux :
 /// 1. Désérialise `{cmd, params}`.
-/// 2. Pousse la commande dans le `ExtensionChannel` (qui attend la
-///    réponse de l'extension avec timeout 30 s).
-/// 3. Traduit le résultat :
-///    - `Ok(Response)` → 200 + `{ok:true, result:...}`.
-///    - `Err(NoExtension)` → 504 Gateway Timeout (pas d'extension).
-///    - `Err(Timeout(_))` → 504 Gateway Timeout.
-///    - `Err(ChannelClosed)` → 504 Gateway Timeout.
-///    - `Err(ExtensionError(msg))` → 502 Bad Gateway (extension a
-///      renvoyé `ok:false`).
+/// 2. Délègue à [`send_cmd`] (mapping d'erreur uniforme).
+/// 3. Wrap le `Ok` dans `{ok:true, result:...}`.
 async fn v2_cmd(
     Extension(channel): Extension<ExtensionChannel>,
     Json(req): Json<CmdRequest>,
-) -> impl IntoResponse {
-    match channel.send_command(req.cmd, req.params).await {
-        Ok(resp) => {
-            // resp.ok est toujours true ici (Channel mappe false → Err).
+) -> Response {
+    match send_cmd(&channel, req.cmd, req.params).await {
+        Ok(result) => {
             let body = CmdResponse {
                 ok: true,
-                result: resp.result,
+                result: Some(result),
                 error: None,
             };
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(CommandError::NoExtension) => {
-            tracing::warn!("/v2/cmd refusé : aucune extension connectée");
-            let body = CmdResponse {
-                ok: false,
-                result: None,
-                error: Some("no_extension_connected".into()),
-            };
-            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
-        }
-        Err(CommandError::Timeout(d)) => {
-            tracing::warn!(timeout = ?d, "/v2/cmd : timeout en attendant l'extension");
-            let body = CmdResponse {
-                ok: false,
-                result: None,
-                error: Some(format!("extension_timeout_{}s", d.as_secs())),
-            };
-            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
-        }
-        Err(CommandError::ChannelClosed) => {
-            tracing::warn!("/v2/cmd : canal oneshot fermé (extension déconnectée)");
-            let body = CmdResponse {
-                ok: false,
-                result: None,
-                error: Some("extension_disconnected".into()),
-            };
-            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
-        }
-        Err(CommandError::ExtensionError(msg)) => {
-            tracing::warn!(error = %msg, "/v2/cmd : l'extension a renvoyé ok=false");
-            let body = CmdResponse {
-                ok: false,
-                result: None,
-                error: Some(msg),
-            };
-            (StatusCode::BAD_GATEWAY, Json(body)).into_response()
-        }
+        Err(resp) => resp,
     }
+}
+
+// ─── Task 3 : endpoints de commodité ──────────────────────────────────────
+
+/// Corps de `POST /v2/open` : une URL à ouvrir dans un nouvel onglet.
+#[derive(Debug, Deserialize)]
+pub struct OpenRequest {
+    /// URL absolue (schéma http ou https). Les hôtes interdits
+    /// (localhost, 127.0.0.0/8, RFC1918) sont rejetés en 403.
+    pub url: Option<String>,
+}
+
+/// Réponse de `POST /v2/open` : `{ok:true, result:{tab_id:N}}` en cas
+/// de succès, `{ok:false, error:"..."}` sinon.
+#[derive(Debug, Serialize)]
+pub struct OpenResponse {
+    pub ok: bool,
+    /// Résultat de la commande `tabs_create` : `{tab_id, url?}` selon
+    /// ce que renvoie l'extension. `None` en cas d'erreur.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Handler `POST /v2/open {"url"}` — enveloppement de `tabs_create`.
+///
+/// 1. Valide que l'URL est présente et que l'hôte n'est pas interdit
+///    (réutilise `vigil::is_forbidden_host`).
+/// 2. Délègue à [`send_cmd`] avec la commande `tabs_create`.
+/// 3. Retourne `{ok:true, result:{tab_id:N}}` ou une erreur déjà
+///    formatée par `send_cmd`.
+async fn v2_open(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<OpenRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    // 1) Validation locale : URL présente + hôte non interdit.
+    let url = match req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_url"),
+    };
+    let host = match extract_host(url) {
+        Some(h) => h,
+        None => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_url");
+        }
+    };
+    if vigil::is_forbidden_host(&host) {
+        tracing::warn!(host = %host, "/v2/open : hôte interdit");
+        return error_response(StatusCode::FORBIDDEN, "forbidden_target");
+    }
+
+    // 2) Envoi via le canal. Paramètres = {"url": "<url>"}. On inclut
+    // `active: true` pour que l'onglet soit visible côté extension
+    // (chrome.tabs.create defaults à active=true de toute façon, mais
+    // c'est plus lisible).
+    let params = json!({ "url": url, "active": true });
+    match send_cmd(&channel, "tabs_create", params).await {
+        Ok(result) => {
+            let body = OpenResponse {
+                ok: true,
+                result: Some(result),
+                error: None,
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// Corps de `POST /v2/read` : un `tab_id` (entier) à lire.
+#[derive(Debug, Deserialize)]
+pub struct ReadRequest {
+    /// Identifiant entier de l'onglet à lire (renvoyé par `/v2/open`
+    /// ou par `POST /v2/cmd` avec cmd=`tabs_create`).
+    pub tab_id: Option<i64>,
+}
+
+/// Réponse de `POST /v2/read` : `{ok:true, text:"…"}` en cas de succès.
+#[derive(Debug, Serialize)]
+pub struct ReadResponse {
+    pub ok: bool,
+    /// Texte tronqué (200 Ko côté extension par défaut). `None` si erreur.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Handler `POST /v2/read {"tab_id":N}` — enveloppement de `read`.
+///
+/// 1. Valide la présence de `tab_id`.
+/// 2. Délègue à [`send_cmd`] avec la commande `read {tab_id}`.
+/// 3. Extrait `result.text` du retour et l'enveloppe dans `{ok:true, text}`.
+///
+/// Note : la troncature à 200 Ko est faite **côté extension** (cf.
+/// `cmdRead` dans `background.js`). Le démon ne tronque pas une 2ᵉ fois.
+async fn v2_read(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<ReadRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    // 1) tab_id est requis. On accepte les entiers 0 et négatifs
+    // (chrome.tabs autorise des IDs signés en théorie), mais on
+    // vérifie la présence (`Option<i64>`). On ne valide pas le type
+    // non-entier : c'est l'affaire de `JsonRejection` → `invalid_body`.
+    let tab_id = match req.tab_id {
+        Some(n) => n,
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_tab_id"),
+    };
+    let params = json!({ "tab_id": tab_id });
+    match send_cmd(&channel, "read", params).await {
+        Ok(result) => {
+            // L'extension renvoie `{text: "..."}`. Si la forme est
+            // inattendue (panique JSON côté extension), on tombe sur
+            // `null` et on retourne une 502.
+            let text = result
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match text {
+                Some(t) => {
+                    let body = ReadResponse {
+                        ok: true,
+                        text: Some(t),
+                        error: None,
+                    };
+                    (StatusCode::OK, Json(body)).into_response()
+                }
+                None => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "extension_returned_unexpected_shape",
+                ),
+            }
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// Extrait le host (schéma + autorité) d'une URL `http://host[:port]/…`
+/// ou `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
+///
+/// On évite la dépendance à `url::Url` (légère mais optionnelle) — un
+/// split sur `://` puis sur `/` suffit pour les formes canoniques.
+/// C'est ce que fait aussi l'extension (`new URL(...)`) pour `webRequest`.
+fn extract_host(url: &str) -> Option<String> {
+    // Schéma http ou https uniquement (pas de file://, ws://, javascript:).
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    let host = authority.split(':').next()?;
+    if host.is_empty() {
+        return None;
+    }
+    // Décode les crochets IPv6 : `http://[::1]/` → `::1`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| host.to_string());
+    Some(host)
 }
 
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
@@ -156,6 +398,8 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
         .route("/cmd", post(v2_cmd))
+        .route("/open", post(v2_open))
+        .route("/read", post(v2_read))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
         .layer(Extension(channel))
@@ -207,9 +451,11 @@ pub fn router(ctx: VigilCtx, channel: ExtensionChannel) -> Router {
 
 /// Router v1 + sous-router `/v2` protégé par `auth::require_token`.
 ///
-/// Le sous-router /v2 expose `/ping` (trivial) et `/cmd` (POST, modèle
-/// webbridge). Le `channel` est posé à la fois sur le routeur racine
-/// (pour `/ws`) et passé à `v2_router` (pour `/v2/cmd`).
+/// Le sous-router /v2 expose `/ping` (trivial), `/cmd` (POST, modèle
+/// webbridge brut), `/open` (POST, ouvre un onglet avec garde-fou
+/// localhost/RFC1918) et `/read` (POST, lit le innerText d'un onglet).
+/// Le `channel` est posé à la fois sur le routeur racine (pour `/ws`)
+/// et passé à `v2_router` (pour les routes `/v2/*`).
 pub fn router_with_v2(
     ctx: VigilCtx,
     config: Config,
