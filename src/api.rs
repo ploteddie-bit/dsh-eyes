@@ -535,6 +535,162 @@ async fn v2_wait(
         Err(resp) => resp,
     }
 }
+// ── Task 6 : screenshot + détection captcha ────────────────────────────
+//
+// Deux endpoints de commodité qui enveloppent `send_cmd` (modèle webbridge),
+// même motif que `v2_goto`/`v2_click`. La commande `screenshot` renvoie un
+// dataURL `data:image/png;base64,…` ; on extrait la partie base64 pour
+// renvoyer `{ok:true, b64:"…"}`. La commande `captcha_detect` renvoie
+// `{detected, type, selector, image_b64?}` qu'on remonte tel quel.
+//
+// v1 simple : le `image_b64` du captcha = capture plein écran (pas de crop).
+// Le crop viendra plus tard (off-screen canvas côté extension).
+
+/// Corps de `POST /v2/page/screenshot {"tab_id"?,"format"?}`.
+/// `format` est `"png"` (défaut) ou `"jpeg"`. `tab_id` est optionnel :
+/// l'extension prend l'onglet actif si absent.
+#[derive(Debug, Deserialize)]
+pub struct ScreenshotRequest {
+    pub tab_id: Option<i64>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Réponse de `POST /v2/page/screenshot` : `{ok:true, format, b64}`.
+#[derive(Debug, Serialize)]
+pub struct ScreenshotResponse {
+    pub ok: bool,
+    /// Format effectivement utilisé (`png` ou `jpeg`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Chaîne base64 (sans le préfixe `data:image/...;base64,`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Handler `POST /v2/page/screenshot` — délègue à `send_cmd` avec la
+/// commande `screenshot` puis extrait `data_url` en `b64` (on strippe
+/// le préfixe MIME côté serveur pour faciliter la consommation
+/// client).
+async fn v2_page_screenshot(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<ScreenshotRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    // Validation légère : si `format` est fourni, on vérifie qu'il vaut
+    // "png" ou "jpeg". Les autres formes sont rejetées en 400 pour
+    // éviter qu'une faute de frappe silencieuse ne renvoie un format
+    // inattendu.
+    let format = match req.format.as_deref().map(str::trim) {
+        None | Some("") | Some("png") | Some("jpeg") => req.format.clone(),
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid_format: '{other}' (attendu 'png' ou 'jpeg')"),
+            );
+        }
+    };
+    let params = json!({ "tab_id": req.tab_id, "format": format });
+    log_action("page_screenshot", params.clone());
+    match send_cmd(&channel, "screenshot", params).await {
+        Ok(result) => {
+            // L'extension renvoie `{format, data_url}`. On extrait la
+            // partie base64 du dataURL. Si la forme est inattendue (pas
+            // un string, pas de virgule), on tombe sur une 502 dédiée
+            // — jamais d'unwrap.
+            let data_url = result
+                .get("data_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let fmt = result
+                .get("format")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match data_url {
+                Some(d) => {
+                    let b64 = match d.split_once(',') {
+                        Some((_prefix, payload)) => payload.to_string(),
+                        None => d, // pas de virgule : on renvoie brut
+                    };
+                    let body = ScreenshotResponse {
+                        ok: true,
+                        format: fmt.or_else(|| Some("png".to_string())),
+                        b64: Some(b64),
+                        error: None,
+                    };
+                    (StatusCode::OK, Json(body)).into_response()
+                }
+                None => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "extension_returned_unexpected_shape",
+                ),
+            }
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// Corps de `POST /v2/page/captcha {"tab_id"?}` — pas de validation
+/// spécifique, `tab_id` est résolu côté extension.
+#[derive(Debug, Deserialize)]
+pub struct CaptchaRequest {
+    pub tab_id: Option<i64>,
+}
+
+/// Réponse de `POST /v2/page/captcha` : `{ok:true, detected, type,
+/// selector?, image_b64?}`. On sérialise en JSON libre (forme dict
+/// passée telle quelle) — le format exact est imposé par l'extension
+/// (cf. `cmdCaptchaDetect`).
+#[derive(Debug, Serialize)]
+pub struct CaptchaResponse {
+    pub ok: bool,
+    /// Résultat de la détection (forme dict). `None` en cas d'erreur.
+    /// On laisse `serde_json` aplatir le dict dans la réponse pour
+    /// rester agnostique du schéma exact.
+    #[serde(flatten)]
+    pub result: serde_json::Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Handler `POST /v2/page/captcha` — délègue à `send_cmd` avec la
+/// commande `captcha_detect`. La réponse de l'extension
+/// (`{detected, type, selector?, image_b64?}`) est fusionnée dans le
+/// `CaptchaResponse` via `flatten`.
+async fn v2_page_captcha(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<CaptchaRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let params = json!({ "tab_id": req.tab_id });
+    log_action("page_captcha", params.clone());
+    match send_cmd(&channel, "captcha_detect", params).await {
+        Ok(result) => {
+            // L'extension renvoie `{detected, type, selector?, image_b64?}`.
+            // On extrait en `serde_json::Map` pour le `flatten`. Si la
+            // forme n'est pas un objet, on retourne une 502 dédiée.
+            let map = match result {
+                Value::Object(m) => m,
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "extension_returned_unexpected_shape",
+                    );
+                }
+            };
+            let body = CaptchaResponse {
+                ok: true,
+                result: map,
+                error: None,
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(resp) => resp,
+    }
+}
+
 /// Extrait le host (schéma + autorité) d'une URL `http://host[:port]/…`
 /// ou `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
 ///
@@ -571,6 +727,8 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
         .route("/click", post(v2_click))
         .route("/fill", post(v2_fill))
         .route("/wait", post(v2_wait))
+        .route("/page/screenshot", post(v2_page_screenshot))
+        .route("/page/captcha", post(v2_page_captcha))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
         .layer(Extension(channel))

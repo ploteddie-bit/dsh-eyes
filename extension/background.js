@@ -260,6 +260,16 @@ chrome.webRequest.onCompleted.addListener(
 //     ou que `timeout_ms` soit écoulé. Format d'erreur stable :
 //     `"wait_timeout: '<sel>' introuvable après <N> ms"` — le démon
 //     peut le matcher pour un 504 dédié (cf. spec Task 4).
+//   - "screenshot" {tab_id?, format?} : `chrome.tabs.captureVisibleTab`
+//     sur l'onglet ciblé (résolu sur l'onglet actif si `tab_id` est
+//     omis). Retourne `{format:"png", data_url:<base64 dataURL>}`. Le
+//     dataURL est renvoyé brut — le démon extrait le base64 si besoin.
+//     Nécessite `<all_urls>` dans `host_permissions` (déjà déclaré) ;
+//     `activeTab` n'est PAS requis quand `<all_urls>` est présent.
+//   - "captcha_detect" {tab_id?} : `chrome.scripting.executeScript`
+//     sur l'onglet qui retourne `{detected, type, selector, image_b64?}`
+//     selon les marqueurs DOM. v1 simple : `image_b64` =
+//     `captureVisibleTab` plein écran ; le crop viendra plus tard.
 //
 // Toutes les commandes sont enveloppées dans un timeout local de 25 s
 // (légèrement en deçà du timeout serveur de 30 s pour éviter les races).
@@ -323,6 +333,10 @@ async function dispatchCommand(cmd, params) {
       return cmdFill(params);
     case "wait":
       return cmdWait(params);
+    case "screenshot":
+      return cmdScreenshot(params);
+    case "captcha_detect":
+      return cmdCaptchaDetect(params);
     default:
       throw new Error(`commande inconnue: ${cmd}`);
   }
@@ -506,6 +520,217 @@ async function waitForTabComplete(tab_id) {
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error("waitForTabComplete: timeout 20 s");
+}
+
+// ============================================================================
+// Task 6 — screenshot + détection captcha
+//
+// Modèle : on réutilise `chrome.scripting.executeScript` (déjà autorisé par
+// le manifeste) et `chrome.tabs.captureVisibleTab` (couvert par
+// `<all_urls>` dans `host_permissions`). On NE touche PAS au manifeste :
+// `scripting` + `tabs` + `<all_urls>` suffisent pour ces deux opérations.
+//
+// `chrome.tabs.captureVisibleTab` exige un `windowId` : on le récupère via
+// `chrome.tabs.get(tab_id)`. Si la fenêtre est minimisée ou si l'onglet
+// n'est pas la fenêtre active du navigateur, Chrome peut rejeter
+// l'opération (cf. bug Chrome "Tabs cannot be edited" quand l'onglet est
+// inactif). On accepte l'échec côté extension et on propage l'erreur.
+// ============================================================================
+
+/**
+ * Capture le viewport visible d'un onglet. Retourne un dataURL base64
+ * (`data:image/png;base64,...`) ou un dataURL JPEG selon `format`.
+ *
+ * Params: `{tab_id?, format?}` — `format` est `"png"` par défaut, on
+ * accepte aussi `"jpeg"` (le dataURL commence par `data:image/jpeg;`).
+ *
+ * `chrome.tabs.captureVisibleTab` ne fonctionne que sur l'onglet actif de
+ * la fenêtre — si l'utilisateur appelle `screenshot` sur un onglet en
+ * arrière-plan, Chrome renvoie une erreur. v1 : on tente quand même
+ * (Chrome 120+ assouplit parfois) et on propage l'erreur upstream si
+ * échec. Le client peut alors passer le bon `tab_id` après `goto`.
+ */
+async function cmdScreenshot({ tab_id, format }) {
+  const real_tab_id = await resolveTabId(tab_id);
+  // Récupère le windowId via tabs.get (nécessaire par captureTabs).
+  const tab = await chrome.tabs.get(real_tab_id);
+  if (!tab || typeof tab.windowId !== "number") {
+    throw new Error("screenshot: onglet introuvable ou sans windowId");
+  }
+  const fmt = format === "jpeg" ? "jpeg" : "png";
+  const data_url = await chrome.tabs.captureVisibleTab(tab.windowId, {
+    format: fmt,
+  });
+  if (typeof data_url !== "string" || !data_url.startsWith("data:image/")) {
+    throw new Error("screenshot: captureVisibleTab n'a pas renvoyé de dataURL");
+  }
+  return { format: fmt, data_url };
+}
+
+/**
+ * Détection de captcha v1 — heuristique DOM côté content-script via
+ * `executeScript`. On inspecte des sélecteurs CSS connus (iframes
+ * reCAPTCHA / hCaptcha, classes `.g-recaptcha` / `.h-captcha`,
+ * `<input name*=captcha>`, `<img src*=captcha>`, slider+canvas).
+ *
+ * Si on détecte un type "image" (recaptcha_v2_image, hcaptcha, text),
+ * on capture le viewport complet via `captureVisibleTab` et on le
+ * place dans `image_b64` (le crop de l'élément précis viendra plus
+ * tard — Chrome ne fournit pas de crop server-side dans MV3).
+ *
+ * Params: `{tab_id?}` — pas de validation de host (l'extension a
+ * `<all_urls>`). Retourne :
+ *   `{ detected: bool, type: string, selector?: string, image_b64?: string }`
+ *
+ * Format du `type` (aligné avec le brief Task 6) :
+ *   - "none"               : rien détecté (detected=false).
+ *   - "recaptcha_v2_invisible" : iframe[src*="recaptcha"] sans classe image.
+ *   - "recaptcha_v2_image"     : iframe[src*="recaptcha"] + classe image.
+ *   - "hcaptcha"               : iframe[src*="hcaptcha"] ou .h-captcha.
+ *   - "text"                   : img[src*="captcha"] ou input[name*="captcha"].
+ *   - "slider"                 : class*=slider + canvas.
+ *
+ * Note : l'ordre des vérifications reflète la précédence observée
+ * (reCAPTCHA invisible = cas le plus fréquent en 2026).
+ */
+async function cmdCaptchaDetect({ tab_id }) {
+  const real_tab_id = await resolveTabId(tab_id);
+  const injection = () => {
+    // Helper : retourne le premier élément matchant `sel` ou null.
+    const pick = (sel) => document.querySelector(sel);
+
+    // reCAPTCHA v2 (image OU invisible) : iframe injectée par Google.
+    // L'attribut `src` contient `recaptcha`. La classe du body ou la
+    // taille de l'iframe distinguent "image" (cases à cocher → images)
+    // de "invisible" (badge flottant sans UI).
+    const recaptcha_iframe = pick('iframe[src*="recaptcha"]');
+    if (recaptcha_iframe) {
+      // Heuristique v1 : `recaptcha/api2/audio` ou `recaptcha/api2/image`
+      // → mode image. `recaptcha/api2/bframe` → invisible.
+      const src = (recaptcha_iframe.getAttribute("src") || "").toLowerCase();
+      const is_image =
+        src.includes("/image") || src.includes("/audio") || src.includes("fallback");
+      return {
+        detected: true,
+        type: is_image ? "recaptcha_v2_image" : "recaptcha_v2_invisible",
+        selector: 'iframe[src*="recaptcha"]',
+      };
+    }
+
+    // reCAPTCHA v2/v3 fallback : div .g-recaptcha (sans iframe —
+    // cas rare, présent sur certains sites qui chargent le script en
+    // async). On le classe en "image" par défaut (l'API publique ne
+    // distingue pas v2 de v3 via le DOM).
+    const grecaptcha_div = pick(".g-recaptcha");
+    if (grecaptcha_div) {
+      return {
+        detected: true,
+        type: "recaptcha_v2_image",
+        selector: ".g-recaptcha",
+      };
+    }
+
+    // hCaptcha : iframe OU div .h-captcha.
+    const hcaptcha_iframe = pick('iframe[src*="hcaptcha"]');
+    if (hcaptcha_iframe) {
+      return {
+        detected: true,
+        type: "hcaptcha",
+        selector: 'iframe[src*="hcaptcha"]',
+      };
+    }
+    const hcaptcha_div = pick(".h-captcha");
+    if (hcaptcha_div) {
+      return {
+        detected: true,
+        type: "hcaptcha",
+        selector: ".h-captcha",
+      };
+    }
+
+    // Captcha textuel "old school" : image avec src contenant "captcha"
+    // ou input dont le name contient "captcha".
+    const captcha_img = pick('img[src*="captcha"]');
+    if (captcha_img) {
+      return {
+        detected: true,
+        type: "text",
+        selector: 'img[src*="captcha"]',
+      };
+    }
+    const captcha_input = pick('input[name*="captcha"]');
+    if (captcha_input) {
+      return {
+        detected: true,
+        type: "text",
+        selector: 'input[name*="captcha"]',
+      };
+    }
+
+    // Slider captcha : élément avec class*=slider ET un canvas dedans.
+    const slider_el = Array.from(document.querySelectorAll('[class*="slider"]'))
+      .find((el) => el.querySelector("canvas"));
+    if (slider_el) {
+      // Sélecteur synthétique : on remonte un selector CSS pour
+      // l'élément slider. `tag.class` suffit pour un usage humain.
+      const tag = slider_el.tagName.toLowerCase();
+      const cls = slider_el.getAttribute("class") || "";
+      const sel = cls
+        ? `${tag}.${cls.split(/\s+/).filter(Boolean).join(".")}`
+        : tag;
+      return {
+        detected: true,
+        type: "slider",
+        selector: sel,
+      };
+    }
+
+    // Rien.
+    return { detected: false, type: "none" };
+  };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: real_tab_id },
+    func: injection,
+  });
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error("captcha_detect: executeScript n'a rien renvoyé");
+  }
+  const det = results[0].result;
+  if (!det || typeof det.detected !== "boolean") {
+    throw new Error("captcha_detect: forme de réponse invalide");
+  }
+  // Si captcha "image" détecté : on capture le viewport pour fournir
+  // `image_b64` au client. Pour les types invisibles (pas d'UI à
+  // screenshotter), on omet `image_b64`.
+  if (
+    det.detected &&
+    (det.type === "recaptcha_v2_image" ||
+      det.type === "hcaptcha" ||
+      det.type === "text")
+  ) {
+    try {
+      const tab = await chrome.tabs.get(real_tab_id);
+      const data_url = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: "png",
+      });
+      if (typeof data_url === "string" && data_url.startsWith("data:image/")) {
+        // On extrait la partie base64 (après la virgule) — le démon
+        // n'aura pas besoin du préfixe MIME. v1 : pas de crop, c'est
+        // le viewport entier. La réduction viendra côté serveur
+        // (downscaling) ou plus tard (crop via OffscreenCanvas).
+        const b64 = data_url.includes(",")
+          ? data_url.substring(data_url.indexOf(",") + 1)
+          : data_url;
+        det.image_b64 = b64;
+      }
+    } catch (e) {
+      // Échec capture (onglet inactif, etc.) : on remonte le résultat
+      // de détection SANS image_b64. Le client peut relancer
+      // /v2/page/screenshot séparément.
+      log("captcha_detect: captureVisibleTab a échoué, on continue sans image_b64 :", e && e.message);
+    }
+  }
+  return det;
 }
 
 // Démarrage initial : on tente une connexion tout de suite. Si le démon est
