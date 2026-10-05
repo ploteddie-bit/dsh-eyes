@@ -15,3 +15,9 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 toml = "1"
 getrandom = "0.2"
+chromiumoxide = "0.9.1"
+
+[features]
+# Active un BrowserPool de test (spawn d'un process bidon) sans tirer
+# chromiumoxide, pour valider la logique de cycle de vie en CI headless.
+test-util = []

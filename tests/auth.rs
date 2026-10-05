@@ -13,6 +13,7 @@
 //! (env partagé du process de test — garde de Task 4).
 
 use dsh_eyes::config::Config;
+use dsh_eyes::hands::browser::BrowserPool;
 use dsh_eyes::state::VigilCtx;
 use dsh_eyes::stats::Counters;
 use dsh_eyes::vigil::Allowlist;
@@ -53,7 +54,8 @@ async fn auth_v2_ping_refuse_sans_token_puis_accepte_avec_token() {
 
     // Monte l'application via la nouvelle route v2.
     let ctx = VigilCtx::for_tests(Counters::new(), Allowlist::empty());
-    let app = dsh_eyes::api::router_with_v2(ctx, cfg);
+    let pool = BrowserPool::new(&cfg);
+    let app = dsh_eyes::api::router_with_v2(ctx, cfg, pool);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(async move {

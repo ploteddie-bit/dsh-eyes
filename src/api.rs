@@ -30,6 +30,7 @@ use serde::Serialize;
 
 use crate::auth::{require_token, AuthToken};
 use crate::config::Config;
+use crate::hands::browser::{BrowserPool, BrowserStatus};
 use crate::state::VigilCtx;
 use crate::vigil;
 
@@ -51,18 +52,41 @@ async fn v2_ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// Handler `GET /v2/browser/status` — snapshot JSON-safe du pool navigateur.
+///
+/// Comportement :
+/// - Appelle d'abord `ensure_running()` (idempotent : ne relance que si
+///   crash détecté) — c'est le contrat du brief Task 2 « kill du process
+///   Chrome simulé → ensure_running relance au prochain appel ».
+/// - 200 + `{"running":true,"pages":N,"pid":P}` si Chrome tourne.
+/// - 200 + `{"running":false}` (sans pages ni pid) si le pool n'a pas
+///   pu lancer Chrome (erreur loggée mais on ne fait pas échouer le GET —
+///   sinon un client qui poll le status en boucle pendant un crash
+///   recevrait du 500 spam).
+async fn v2_browser_status(Extension(pool): Extension<BrowserPool>) -> Json<BrowserStatus> {
+    if let Err(e) = pool.ensure_running().await {
+        // Log seulement : on ne fait pas échouer le GET. L'utilisateur
+        // verra `running:false` et pourra diagnostiquer via les logs.
+        tracing::warn!(error = %e, "ensure_running a échoué (status only)");
+    }
+    Json(pool.status().await)
+}
+
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
 /// Le token attendu est transporté par `Extension(AuthToken(...))` posé
 /// sur ce sous-router (pas sur le router racine — ça reste confined à /v2).
+/// Le `BrowserPool` est transporté par `Extension(BrowserPool)` (clone = partage).
 ///
 /// Note : on utilise `nest("/v2", ...)` côté `router_with_v2`, donc ici
-/// le sous-router déclare juste `/ping` — le préfixe `/v2` est ajouté
-/// par le `nest` à la fusion.
-fn v2_router(token: String) -> Router {
+/// le sous-router déclare juste `/ping` et `/browser/status` — le préfixe
+/// `/v2` est ajouté par le `nest` à la fusion.
+fn v2_router(token: String, pool: BrowserPool) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
+        .route("/browser/status", get(v2_browser_status))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
+        .layer(Extension(pool))
 }
 
 /// Nombre max d'alertes servies par `/events` (cf. brief Task 4).
@@ -115,9 +139,18 @@ pub fn router(ctx: VigilCtx) -> Router {
 /// Router v1 + sous-router `/v2` protégé par `auth::require_token`.
 ///
 /// Le token est passé via `Extension(AuthToken)` au sous-router /v2 ; le
-/// middleware le lit dans `request.extensions()`. Aucune route v1 n'est
-/// affectée (on utilise `nest` + `route_layer` qui confinent le middleware
-/// au sous-arbre /v2).
-pub fn router_with_v2(ctx: VigilCtx, config: Config) -> Router {
-    router(ctx).nest("/v2", v2_router(config.api_token().to_string()))
+/// middleware le lit dans `request.extensions()`. Le `BrowserPool` est
+/// passé via `Extension(BrowserPool)` au sous-router /v2 (handlers comme
+/// `/v2/browser/status` le lisent). Aucune route v1 n'est affectée
+/// (on utilise `nest` + `route_layer` qui confinent le middleware au
+/// sous-arbre /v2).
+///
+/// **Changement Task 2** : la signature prend désormais un `BrowserPool`
+/// en plus du `(ctx, config)`. Le test d'auth Task 1 a été mis à jour en
+/// conséquence (cf. `tests/auth.rs`).
+pub fn router_with_v2(ctx: VigilCtx, config: Config, pool: BrowserPool) -> Router {
+    router(ctx).nest(
+        "/v2",
+        v2_router(config.api_token().to_string(), pool),
+    )
 }

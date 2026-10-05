@@ -40,6 +40,9 @@ pub struct Config {
     pub ollama_tier2_url: String,
     /// Active Chrome headless (défaut : `true`).
     pub chrome_headless: bool,
+    /// Chemin explicite vers le binaire Chrome/Chromium. `None` ⇒ détection
+    /// automatique par chromiumoxide (utilise `which`).
+    pub chrome_path: Option<String>,
 }
 
 /// Représentation sérialisable dans `config.toml`. Pas de `api_token`
@@ -52,6 +55,10 @@ pub struct ConfigFile {
     pub ollama_tier2_url: String,
     #[serde(default = "default_chrome_headless")]
     pub chrome_headless: bool,
+    /// Chemin Chrome explicite (optionnel). Si `None`, chromiumoxide
+    /// détecte via `which google-chrome`/`chromium`/etc.
+    #[serde(default)]
+    pub chrome_path: Option<String>,
 }
 
 fn default_ollama_tier1() -> String {
@@ -90,6 +97,7 @@ impl Config {
             ollama_tier1_url: cfg_file.ollama_tier1_url,
             ollama_tier2_url: cfg_file.ollama_tier2_url,
             chrome_headless: cfg_file.chrome_headless,
+            chrome_path: cfg_file.chrome_path,
         })
     }
 
@@ -97,6 +105,21 @@ impl Config {
     /// pour la comparaison constante — jamais loggué, jamais sérialisé.
     pub fn api_token(&self) -> &str {
         &self.api_token
+    }
+
+    /// Constructeur pour les tests. Bypass le chargement réel (token
+    /// généré / fichier `config.toml`) — utilise des valeurs passées en
+    /// argument. Le `api_token` vide est OK pour les tests qui ne
+    /// touchent pas l'auth.
+    #[cfg(test)]
+    pub fn for_tests(chrome_headless: bool, chrome_path: Option<String>) -> Self {
+        Self {
+            api_token: String::new(),
+            ollama_tier1_url: "http://localhost:11434".into(),
+            ollama_tier2_url: "http://localhost:11434".into(),
+            chrome_headless,
+            chrome_path,
+        }
     }
 }
 
