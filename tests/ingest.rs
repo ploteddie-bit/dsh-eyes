@@ -34,7 +34,8 @@ async fn ws_accepte_un_evenement_valide() {
     let addr = listener.local_addr().expect("local_addr");
 
     // Construit le router complet (avec /health et /ws) et spawn le serveur.
-    let app = dsh_eyes::api::router();
+    // Task 3 : `api::router` prend maintenant un `Counters` partagé.
+    let app = dsh_eyes::api::router(dsh_eyes::stats::Counters::new());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });

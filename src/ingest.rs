@@ -12,7 +12,10 @@
 //! Règle dev-rust : zéro `unwrap()/expect()` sur le chemin async/réseau — `?` et `Result`.
 
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::Response,
     routing::get,
     Router,
@@ -21,6 +24,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt as _;
+
+use crate::stats::Counters;
 
 /// Format d'un événement de navigation reçu sur WS.
 /// `#[serde(deny_unknown_fields)]` garantit que les clients envoyant des champs
@@ -66,12 +71,17 @@ impl Ack {
 }
 
 /// Handler axum : upgrade la requête HTTP en WebSocket et délègue à [`handle_socket`].
-pub async fn ws_handler(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_socket)
+/// Récupère le `Counters` partagé via `State` (câblé par `ws_router`).
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(counters): State<Counters>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, counters))
 }
 
 /// Boucle principale côté serveur : lit les messages texte, parse, persiste, répond.
-async fn handle_socket(socket: WebSocket) {
+/// `counters` est cloné dans la closure d'upgrade : pas besoin de le re-cloner par message.
+async fn handle_socket(socket: WebSocket, counters: Counters) {
     let (mut sink, mut stream) = socket.split();
     let path = match events_path() {
         Ok(p) => p,
@@ -100,6 +110,10 @@ async fn handle_socket(socket: WebSocket) {
                 let raw = text.to_string();
                 match serde_json::from_str::<NavEvent>(&raw) {
                     Ok(evt) => {
+                        // Incrémente les compteurs *avant* la persistance :
+                        // l'événement est syntaxiquement valide, donc « accepté ».
+                        // (cf. brief Task 3)
+                        counters.record_async(&evt.domain, evt.bytes).await;
                         // Persiste puis acquitte.
                         match append_event(&path, &evt).await {
                             Ok(()) => {
@@ -199,6 +213,9 @@ async fn append_event(path: &std::path::Path, evt: &NavEvent) -> std::io::Result
 }
 
 /// Sous-router WS — utile aux tests d'intégration pour isoler `/ws`.
-pub fn ws_router() -> Router {
-    Router::new().route("/ws", get(ws_handler))
+/// Le `Counters` est partagé via `State` (cf. choix d'architecture api.rs).
+pub fn ws_router(counters: Counters) -> Router {
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(counters)
 }
