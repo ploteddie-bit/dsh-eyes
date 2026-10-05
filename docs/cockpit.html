@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     TEMPLATE OFFICIEL : eddie-cockpit-v1
+     Document de travail VIVANT obligatoire — remplace tout handover markdown.
+     Règle AGENTS.md (gravée 2026-09-10) : c'est la bible de chaque projet.
+     Générer une instance :  python3 $HOME/.kimi-code/bin/new-cockpit.py <projet> <repertoire>
+     Personnalisation : remplir le bloc DONNEES (const COCKPIT) dans le code JavaScript.
+     Persistance : localStorage (clé = cockpit-DSH Eyes). Aucune dépendance externe.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏠 Le Chantier — DSH Eyes</title>
+<style>
+:root{--fond:#0d1117;--carte:#161b22;--carte2:#1c232c;--bord:#21262d;--texte:#e6edf3;--muted:#8b949e;--orange:#d4540b;--orange2:#f97316;--cyan:#3366ff;--vert:#3fb950;--rouge:#f85149;--ambre:#d29922}
+*{box-sizing:border-box}body{margin:0;background:var(--fond);color:var(--texte);font:15px/1.6 -apple-system,'Segoe UI',Roboto,sans-serif}
+.wrap{max-width:1120px;margin:0 auto;padding:20px}a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:24px;margin:0 0 4px}h2{font-size:19px;color:var(--orange2);border-bottom:2px solid var(--bord);padding-bottom:6px;margin-top:0}
+.muted{color:var(--muted)}.small{font-size:13px}
+header{background:linear-gradient(160deg,#161b22,#0d1117);border:1px solid var(--bord);border-radius:14px;padding:18px 22px;margin-bottom:16px}
+.titre{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+.horloge{font-family:ui-monospace,monospace;font-size:13px;color:var(--cyan)}
+.jauges{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px}
+.jauge{flex:1;min-width:180px;background:var(--carte);border:1px solid var(--bord);border-radius:10px;padding:10px 14px}
+.jauge .num{font-size:22px;font-weight:700;color:var(--orange2);font-family:ui-monospace,monospace}
+.jauge .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.barre{height:8px;background:#0a0d12;border-radius:4px;overflow:hidden;margin-top:8px}.barre>div{height:100%;background:linear-gradient(90deg,var(--orange),var(--orange2));width:0%;transition:width .8s}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tab{padding:9px 16px;background:var(--carte);border:1px solid var(--bord);border-radius:9px;cursor:pointer;font-size:14px;color:var(--muted);user-select:none}
+.tab:hover{color:var(--texte)}.tab.actif{background:var(--carte2);color:var(--orange2);border-color:var(--orange);font-weight:600}
+.vue{display:none}.vue.actif{display:block}
+.carte{background:var(--carte);border:1px solid var(--bord);border-radius:12px;padding:16px 18px;margin:12px 0}
+.zone{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;margin:2px 4px 2px 0}
+.z-vert{background:#12301f;color:var(--vert)}.z-orange{background:#332a14;color:var(--ambre)}.z-rouge{background:#3a1e1e;color:var(--rouge)}
+.src{display:flex;align-items:center;gap:10px;background:var(--carte);border:1px solid var(--bord);border-radius:10px;padding:10px 14px;margin:8px 0;flex-wrap:wrap}
+.src .ic{font-size:18px;width:26px;text-align:center}.src .nom{font-weight:600;min-width:190px}
+.src .chemin{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted);flex:1;min-width:200px;word-break:break-all}
+.src .copier,.src .ouvrir{font-size:12px;padding:4px 10px;border-radius:7px;border:1px solid var(--bord);background:var(--carte2);color:var(--texte);cursor:pointer}
+.src .copier:hover{border-color:var(--orange);color:var(--orange2)}.src .ouvrir{color:#58a6ff;border-color:#1f3a5f}
+.cat{margin-top:22px;font-size:13px;color:var(--orange2);text-transform:uppercase;letter-spacing:.1em;font-weight:700}
+.chantier{background:var(--carte);border:1px solid var(--bord);border-radius:12px;padding:14px 16px;margin:10px 0}
+.chantier.fait{border-color:var(--vert);opacity:.75}
+.chantier .titre-ch{display:flex;align-items:center;gap:10px}
+.chantier input[type=checkbox]{width:18px;height:18px;accent-color:var(--vert);cursor:pointer}
+.critere{font-size:13px;color:var(--muted);margin:8px 0 4px}
+.cmd{display:flex;gap:8px;align-items:center;background:#0a0d12;border:1px solid var(--bord);border-radius:8px;padding:7px 10px;margin:6px 0;font-family:ui-monospace,monospace;font-size:12px}
+.cmd code{flex:1;color:#79c0ff;word-break:break-all}
+.cmd button{font-size:11px;padding:3px 9px;border-radius:6px;border:1px solid var(--bord);background:var(--carte2);color:var(--texte);cursor:pointer}
+.regle{display:flex;gap:12px;background:var(--carte);border:1px solid var(--bord);border-left:4px solid var(--rouge);border-radius:10px;padding:12px 14px;margin:10px 0}
+.regle .n{font-size:20px;font-weight:800;color:var(--rouge);font-family:ui-monospace,monospace}
+.bloc4{background:var(--carte);border:1px solid var(--bord);border-left:4px solid var(--cyan);border-radius:10px;padding:12px 16px;margin-top:18px;font-size:13px}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--carte2);border:1px solid var(--vert);color:var(--vert);padding:10px 22px;border-radius:10px;transition:transform .3s;font-size:14px;z-index:99}
+.toast.visible{transform:translateX(-50%) translateY(0)}
+#pb-input{width:70%;background:#0a0d12;border:1px solid var(--bord);border-radius:8px;color:var(--texte);padding:8px 12px;font-size:14px}
+#pb-zone{background:#0a0d12;border:1px solid var(--bord);border-radius:8px;color:var(--texte);padding:8px}
+#pb-ajoute{background:var(--orange);border:none;color:#fff;border-radius:8px;padding:8px 16px;cursor:pointer;font-weight:600}
+#pb-notes{width:100%;min-height:110px;background:#0a0d12;border:1px solid var(--bord);border-radius:8px;color:var(--texte);padding:10px 12px;font-size:14px;resize:vertical}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="titre"><div><h1>🏠 Le Chantier — DSH Eyes</h1><div class="muted small" id="sous-titre">Document de travail vivant — la bible du projet (eddie-cockpit-v1)</div></div><div class="horloge" id="horloge">--:--:--</div></div>
+  <div class="jauges">
+    <div class="jauge"><div class="lbl">Phase</div><div class="num" id="phase" style="font-size:16px">Démarrage</div><div class="barre"><div id="barre-phase"></div></div><div class="small muted" id="phase-detail">à personnaliser : phase courante du projet</div></div>
+    <div class="jauge"><div class="lbl">Échéance suivante</div><div class="num" id="cd-echeance">--</div><div class="small muted">à personnaliser : prochaine échéance</div></div>
+    <div class="jauge"><div class="lbl">Chantiers validés</div><div class="num" id="cd-chantiers">0 / 0</div><div class="barre"><div id="barre-chantiers"></div></div></div>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab actif" data-vue="pensebete">📋 Pense-bête</div>
+  <div class="tab" data-vue="contexte">🧭 Contexte</div>
+  <div class="tab" data-vue="sources">🔗 Les Sources</div>
+  <div class="tab" data-vue="chantiers">✅ Les Chantiers</div>
+  <div class="tab" data-vue="regles">🧠 Les Règles</div>
+</div>
+
+<div class="vue actif" id="vue-pensebete">
+  <h2>📋 Pense-bête permanent</h2>
+  <p class="small muted">Coche quand c'est fait et prouvé. Ajout rapide : Entrée. Tout se souvient.</p>
+  <div class="carte">
+    <input id="pb-input" placeholder="nouvelle étape…"> <select id="pb-zone"><option value="v">🟢 verte</option><option value="o" selected>🟠 orange</option><option value="r">🔴 rouge</option></select>
+    <button id="pb-ajoute" onclick="pbAjoute()">Ajouter</button> <span id="pb-compteur" style="font-family:ui-monospace,monospace;color:var(--orange2)"></span>
+  </div>
+  <div id="pb-liste"></div>
+  <div class="carte"><div class="small muted" style="margin-bottom:6px">📝 Bloc-notes libre (sauvegarde auto) :</div>
+    <textarea id="pb-notes" placeholder="idées, rappels, choses à ne pas oublier…"></textarea><div class="small muted" id="pb-sauve">—</div></div>
+</div>
+
+<div class="vue" id="vue-contexte"><h2>🧭 Contexte du projet</h2><div id="ctx-carte"></div></div>
+<div class="vue" id="vue-sources"><h2>Cartographie des sources</h2><p class="small muted">Chaque source : chemin exact (📋 copier) et lien direct quand ouvrable (↗ ouvrir).</p><div id="src-liste"></div></div>
+<div class="vue" id="vue-chantiers"><h2>Les chantiers — coche, ça se souvient</h2><div id="liste-chantiers"></div></div>
+<div class="vue" id="vue-regles"><h2>🧠 Les règles non négociables</h2><div id="regles-liste"></div></div>
+
+<div class="bloc4">
+  <b>Statut réel :</b> <b>planifié</b> (plan 7 tâches écrit, zéro ligne de code Rust encore) · <b>Portée réelle :</b> documents uniquement — plan d'exécution + cockpit + inventaire écosystème · <b>Preuve :</b> <code>docs/superpowers/plans/2026-10-05-dsh-eyes.md</code> existe, repo <code>~/projets/dsh-eyes/</code> initialisé sans Cargo.toml · <b>Prochaine étape :</b> exécuter le plan en mode subagent-driven (session future : « exécute le plan dsh-eyes »)
+</div>
+<div class="toast" id="toast">📋 Copié</div>
+</div>
+
+<script>
+/* ═══ DONNEES — personnaliser ici (le reste du moteur ne se touche pas) ═══ */
+const COCKPIT={
+  cle:'cockpit-dsh-eyes',
+  contexte:"<b>DSH Eyes</b> — les yeux du harnais dans Chrome, écrits en <b>Rust</b> (standard dev-rust). Une extension Chrome MV3 (métadonnées de navigation uniquement, jamais le contenu des pages) pousse chaque requête vers un démon Rust (tokio + axum + tokio-tungstenite) sur <code>127.0.0.1:8445</code> : compteurs de volumes par domaine, vigil de sécurité (alerte critical sur toute tentative d'accès à localhost / réseaux privés / domaine inconnu — rappel 05/10 : l'agent KimiCU a demandé localhost, refusé), journal JSONL persistant dans <code>~/.dsh-eyes/</code>. <b>Pourquoi</b> : la journée du 05/10 a montré des agents IA actifs invisibles (kimi-cu), des flux vers des clouds chinois, un forfait consommé sans supervision — DSH Eyes rend tout ça visible en direct. <b>Plan d'exécution</b> : <code>docs/superpowers/plans/2026-10-05-dsh-eyes.md</code> (7 tâches, mode subagent-driven). <b>Inventaire écosystème</b> : <code>Edy:~/.dsh/docs/ecosysteme-local.md</code> (à tenir à jour).",
+  echeanceJours:7, echeanceHeure:9,
+  sources:[
+    {ic:'📋',nom:'Plan d\'exécution (7 tâches)',chemin:'Edy:~/projets/dsh-eyes/docs/superpowers/plans/2026-10-05-dsh-eyes.md'},
+    {ic:'🧭',nom:'Inventaire écosystème local IA',chemin:'Edy:~/.dsh/docs/ecosysteme-local.md'},
+    {ic:'🦀',nom:'Standard qualité Rust (à charger avant tout code)',chemin:'Edy:~/.dsh/skills/dev-rust/'},
+    {ic:'📂',nom:'Projet (repo git)',chemin:'Edy:~/projets/dsh-eyes/'},
+  ],
+  chantiers:[
+    {n:'Task 1 — Scaffolding Rust + API /health',c:'curl http://127.0.0.1:8445/health → {"ok":true} ; cargo clippy -D warnings vert',cmds:['cd ~/projets/dsh-eyes && cargo check && cargo clippy -- -D warnings']},
+    {n:'Task 2 — Ingestion WebSocket + JSONL',c:'un événement WS envoyé → une ligne dans ~/.dsh-eyes/events.jsonl ; cargo test vert',cmds:['cargo test','node -e "const W=require(\'ws\');const w=new W(\'ws://127.0.0.1:8445/ws\');w.on(\'open\',()=>w.send(JSON.stringify({ts:Date.now(),domain:\'test.local\',url:\'https://test.local/\',kind:\'request\',bytes:1})));w.on(\'message\',m=>{console.log(m.toString());process.exit(0)})"']},
+    {n:'Task 3 — Compteurs par domaine + /stats',c:'/stats renvoie les compteurs exacts après un burst WS de test',cmds:['curl -s http://127.0.0.1:8445/stats']},
+    {n:'Task 4 — Vigil (localhost critical, privé warning, new_domain info)',c:'événement vers 127.0.0.1 → alerte dans ~/.dsh-eyes/alerts.jsonl + /events',cmds:['curl -s http://127.0.0.1:8445/events']},
+    {n:'Task 5 — Extension Chrome MV3',c:'extension chargée + 3 sites visités → /stats les compte ; zéro contenu de page capturé',cmds:[]},
+    {n:'Task 6 — E2E + build statique musl',c:'file target/.../dsh-eyes → statically linked ; alerte localhost déclenchée par visite réelle de /health',cmds:['rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl']},
+    {n:'Task 7 — Revue finale sécurité + maj inventaire',c:'clippy vert branche entière ; Edy:~/.dsh/docs/ecosysteme-local.md section DSH Eyes écrite',cmds:['cargo clippy -- -D warnings']},
+  ],
+  regles:[
+    'Preuve brute obligatoire : « ça devrait marcher » est interdit.',
+    'Zone rouge (credentials, DNS, suppression, comptes) : jamais seul.',
+    'Standard dev-rust : zéro unwrap/expect en async-réseau ; APIs vérifiées sur docs.rs ; Cargo.lock versionné.',
+    'Le démon n\'écoute QUE sur 127.0.0.1:8445 — jamais 0.0.0.0.',
+    'L\'extension capture des MÉTADONNÉES (domaine, taille, horodatage) — jamais le contenu des pages ; rien ne quitte la machine.',
+    'Le contrôle des tokens consommés vit chez Moonshot (kimi.com usage) — pas en local : DSH Eyes mesure les VOLUMES, pas la facture.',
+    'Leçon 05/10 : avant de tuer un processus, lire sa CommandLine complète (le NetworkService Chrome porte la GUI DSH 3080).',
+  ],
+};
+/* ═════════════ moteur (ne pas modifier) ═════════════ */
+function tic(){const n=new Date();document.getElementById('horloge').textContent=n.toLocaleTimeString('fr-FR')+' · '+n.toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long'});
+ const e=new Date(n);const delta=((7-n.getDay())%7);e.setDate(n.getDate()+delta);e.setHours(COCKPIT.echeanceHeure,0,0,0);if(e<=n)e.setDate(e.getDate()+7);
+ const s=Math.floor((e-n)/1000),j=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+ document.getElementById('cd-echeance').textContent=(j>0?j+'j ':'')+h+'h '+String(m).padStart(2,'0')+'m';}
+tic();setInterval(tic,1000);
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('actif'));document.querySelectorAll('.vue').forEach(x=>x.classList.remove('actif'));t.classList.add('actif');document.getElementById('vue-'+t.dataset.vue).classList.add('actif')});
+function toast(){const t=document.getElementById('toast');t.classList.add('visible');setTimeout(()=>t.classList.remove('visible'),1400)}
+function bindCopier(){document.querySelectorAll('[data-copier]').forEach(b=>b.onclick=()=>{navigator.clipboard.writeText(b.dataset.copier).then(()=>toast())})}
+document.getElementById('ctx-carte').innerHTML='<div class="carte">'+COCKPIT.contexte+'</div>';
+document.getElementById('src-liste').innerHTML=COCKPIT.sources.map(s=>`<div class="src"><span class="ic">${s.ic||'📎'}</span><span class="nom">${s.nom}</span><span class="chemin">${s.chemin}</span><button class="copier" data-copier="${s.chemin.replace(/"/g,'&quot;')}">📋 copier</button>${s.url?`<a class="ouvrir" href="${s.url}" target="_blank">↗ ouvrir</a>`:''}</div>`).join('');
+const etatCh=JSON.parse(localStorage.getItem(COCKPIT.cle+'-chantiers')||'{}');
+function renduCh(){
+ document.getElementById('liste-chantiers').innerHTML=COCKPIT.chantiers.map((c,i)=>
+  `<div class="chantier ${etatCh[i]?'fait':''}"><div class="titre-ch"><input type="checkbox" ${etatCh[i]?'checked':''} onchange="cocheCh(${i})"><b>${c.n}</b></div><div class="critere">✓ Critère : ${c.c}</div>`+
+  (c.cmds||[]).map(x=>`<div class="cmd"><code>${x.replace(/</g,'&lt;')}</code><button data-copier="${x.replace(/"/g,'&quot;')}">📋 copier</button></div>`).join('')+'</div>').join('');
+ bindCopier();
+ const nb=Object.values(etatCh).filter(Boolean).length;
+ document.getElementById('cd-chantiers').textContent=nb+' / '+COCKPIT.chantiers.length;
+ document.getElementById('barre-chantiers').style.width=(COCKPIT.chantiers.length?nb/COCKPIT.chantiers.length*100:0)+'%';}
+function cocheCh(i){etatCh[i]=!etatCh[i];localStorage.setItem(COCKPIT.cle+'-chantiers',JSON.stringify(etatCh));renduCh()}
+renduCh();
+document.getElementById('regles-liste').innerHTML=COCKPIT.regles.map((r,i)=>`<div class="regle"><div class="n">${i+1}</div><div>${r}</div></div>`).join('');
+/* pense-bête */
+const PB_SEED=[]; /* {id,z,t} — étapes pré-remplies du chantier courant */
+const PBK=COCKPIT.cle+'-pb';
+let pb=JSON.parse(localStorage.getItem(PBK)||'null')||{coche:{},ajoutees:[],notes:''};
+function pbSave(){localStorage.setItem(PBK,JSON.stringify(pb))}
+function pbRendu(){
+ const toutes=[...PB_SEED.map(x=>({...x,seed:true})),...pb.ajoutees];
+ document.getElementById('pb-liste').innerHTML=toutes.map(t=>{
+  const zf={v:['z-vert','🟢'],o:['z-orange','🟠'],r:['z-rouge','🔴']}[t.z||'o'];const fait=pb.coche[t.id];
+  return `<div class="src" style="${fait?'opacity:.55':''}"><span class="ic">${fait?'✅':'⬜'}</span><span class="nom" style="${fait?'text-decoration:line-through':''}"><span class="zone ${zf[0]}">${zf[1]}</span>${t.t}</span>${t.seed?'':`<button class="copier" onclick="pbSupprime('${t.id}')">🗑️</button>`}<button class="copier" onclick="pbCoche('${t.id}')">${fait?'↩︎ à faire':'✔ fait'}</button></div>`}).join('');
+ const reste=toutes.filter(t=>!pb.coche[t.id]).length;
+ document.getElementById('pb-compteur').textContent=reste+' à faire · '+(toutes.length-reste)+' faites';}
+function pbCoche(id){pb.coche[id]=!pb.coche[id];pbSave();pbRendu()}
+function pbSupprime(id){pb.ajoutees=pb.ajoutees.filter(t=>t.id!==id);delete pb.coche[id];pbSave();pbRendu()}
+function pbAjoute(){const inp=document.getElementById('pb-input');const t=inp.value.trim();if(!t)return;
+ pb.ajoutees.push({id:'pers-'+Date.now(),z:document.getElementById('pb-zone').value,t});inp.value='';pbSave();pbRendu()}
+document.getElementById('pb-input').addEventListener('keydown',e=>{if(e.key==='Enter')pbAjoute()});
+const notesEl=document.getElementById('pb-notes');notesEl.value=pb.notes||'';
+notesEl.addEventListener('input',()=>{pb.notes=notesEl.value;pbSave();document.getElementById('pb-sauve').textContent='sauvegardé à '+new Date().toLocaleTimeString('fr-FR')});
+pbRendu();
+</script>
+</body>
+</html>
