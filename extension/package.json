@@ -1,0 +1,12 @@
+{
+  "name": "dsh-eyes-extension-test",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Client de test pour valider le contrat WS de l'extension DSH Eyes (Task 5).",
+  "scripts": {
+    "test": "node test-ws-client.js"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  }
+}
