@@ -66,6 +66,97 @@ function enqueue(evt) {
   }
 }
 
+// ── Mains (REWORK 2026-10-05, modèle webbridge) ─────────────────────────
+// Exécute une commande du démon dans le navigateur, puis répond sur la même
+// WS : {cmd_id, ok:true, result} ou {cmd_id, ok:false, error}.
+
+function sendCmdResponse(cmdId, ok, resultOrError) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log(`cmd ${cmdId}: WS fermée, réponse perdue`);
+    return;
+  }
+  const msg = ok
+    ? { cmd_id: cmdId, ok: true, result: resultOrError }
+    : { cmd_id: cmdId, ok: false, error: resultOrError };
+  ws.send(JSON.stringify(msg));
+}
+
+async function activeTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) throw new Error("aucun onglet actif");
+  return tab;
+}
+
+// Dispatch des commandes supportées. Toute erreur → {ok:false,error}, jamais
+// de crash du service worker.
+async function handleCommand(cmdId, cmd, params) {
+  try {
+    let result;
+    switch (cmd) {
+      case "tabs_create":
+      case "goto": {
+        if (!params.url) throw new Error("params.url manquant");
+        const tab = await chrome.tabs.create({
+          url: params.url,
+          active: params.active !== false,
+        });
+        result = { tab_id: tab.id };
+        break;
+      }
+      case "read": {
+        const tabId = params.tab_id ?? (await activeTab()).id;
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () =>
+            document.body ? document.body.innerText.slice(0, 200000) : "",
+        });
+        result = { text: res.result };
+        break;
+      }
+      case "click": {
+        const tabId = params.tab_id ?? (await activeTab()).id;
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (sel) => {
+            const el = document.querySelector(sel);
+            if (!el) throw new Error("sélecteur introuvable: " + sel);
+            el.click();
+            return true;
+          },
+          args: [params.selector],
+        });
+        result = { clicked: res.result };
+        break;
+      }
+      case "fill": {
+        const tabId = params.tab_id ?? (await activeTab()).id;
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (sel, val) => {
+            const el = document.querySelector(sel);
+            if (!el) throw new Error("sélecteur introuvable: " + sel);
+            el.value = val;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          },
+          args: [params.selector, params.value],
+        });
+        result = { filled: res.result };
+        break;
+      }
+      default:
+        throw new Error("cmd inconnue: " + cmd);
+    }
+    log(`cmd ${cmdId} (${cmd}) exécutée`);
+    sendCmdResponse(cmdId, true, result);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    log(`cmd ${cmdId} (${cmd}) échouée :`, msg);
+    sendCmdResponse(cmdId, false, msg);
+  }
+}
+
 // Vide la FIFO en envoyant chaque événement. Si le send échoue, on remet
 // l'événement en tête de file et on interrompt le drain (la reconnexion
 // s'en chargera).
@@ -120,14 +211,23 @@ function connect() {
   });
 
   ws.addEventListener("message", (ev) => {
-    // Le serveur répond {"ok":true} sur événement valide, {"ok":false,"error":...}
-    // sur erreur. On logge les erreurs pour aider au debug (pas critique pour
-    // la stabilité — la WS reste ouverte côté client).
     let payload = null;
     try {
       payload = JSON.parse(ev.data);
     } catch (_) { /* message non-JSON, on ignore */ }
-    if (payload && payload.ok === false) {
+    if (!payload) return;
+
+    // Commande du démon (REWORK 2026-10-05 — modèle webbridge).
+    // Forme : {"cmd_id":N,"cmd":"goto"|"click"|"read"|"fill"|"tabs_create", "params":{...}}
+    if (typeof payload.cmd_id === "number" && typeof payload.cmd === "string") {
+      // Exécution asynchrone ; on protège avec un timeout local.
+      handleCommand(payload.cmd_id, payload.cmd, payload.params || {})
+        .catch((e) => log("handleCommand a crashé :", e && e.message));
+      return;
+    }
+
+    // Ack legacy (réponse du serveur à un événement de navigation).
+    if (payload.ok === false) {
       log("serveur a refusé un événement :", payload.error || "(sans détail)");
     }
   });
@@ -226,6 +326,194 @@ chrome.webRequest.onCompleted.addListener(
   onRequestCompleted,
   { urls: ["<all_urls>"] }
 );
+
+// ============================================================================
+// REWORK 2026-10-05 — modèle webbridge : l'extension reçoit des commandes
+// du démon et les exécute via chrome.tabs / chrome.scripting.executeScript.
+//
+// Commandes supportées :
+//   - "tabs_create" {url} : ouvre un nouvel onglet sur `url` ; attend
+//     `chrome.tabs.onUpdated` status=complete ; retourne {tab_id, url}.
+//   - "goto" {tab_id?, url} : si `tab_id` est fourni, navigue cet onglet
+//     via chrome.tabs.update ; sinon crée un onglet comme tabs_create.
+//   - "read" {tab_id, max_bytes?} : exécute un script qui retourne
+//     `document.body.innerText` (tronqué à `max_bytes` ou 200 Ko par
+//     défaut) ; retourne {text}.
+//   - "click" {tab_id, selector} : exécute `document.querySelector(sel).click()`.
+//   - "fill" {tab_id, selector, value} : exécute
+//     `(el.value = value, el.dispatchEvent(new Event('input', {bubbles:true})))`.
+//
+// Toutes les commandes sont enveloppées dans un timeout local de 25 s
+// (légèrement en deçà du timeout serveur de 30 s pour éviter les races).
+// En cas d'échec on renvoie `{cmd_id, ok:false, error:...}`.
+// ============================================================================
+
+const COMMAND_TIMEOUT_MS = 25_000;
+const READ_MAX_BYTES_DEFAULT = 200 * 1024; // 200 Ko
+
+/**
+ * Dispatch principal d'une commande. Sécurisé par un timeout local.
+ */
+async function handleCommand(cmd_id, cmd, params) {
+  log(`commande #${cmd_id} ${cmd}`, params);
+  let timer;
+  try {
+    const result = await Promise.race([
+      dispatchCommand(cmd, params),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timeout local ${COMMAND_TIMEOUT_MS} ms`)),
+          COMMAND_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    sendResponse({ cmd_id, ok: true, result });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    log(`commande #${cmd_id} échouée :`, msg);
+    sendResponse({ cmd_id, ok: false, error: msg });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Envoie une réponse JSON au démon sur la WS ouverte. */
+function sendResponse(payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log("sendResponse : WS non ouverte, on ne peut pas répondre");
+    return;
+  }
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch (e) {
+    log("sendResponse a échoué :", e && e.message);
+  }
+}
+
+/** Dispatch selon `cmd`. */
+async function dispatchCommand(cmd, params) {
+  switch (cmd) {
+    case "tabs_create":
+      return cmdTabsCreate(params);
+    case "goto":
+      return cmdGoto(params);
+    case "read":
+      return cmdRead(params);
+    case "click":
+      return cmdClick(params);
+    case "fill":
+      return cmdFill(params);
+    default:
+      throw new Error(`commande inconnue: ${cmd}`);
+  }
+}
+
+/** Ouvre un onglet et attend la fin du chargement. */
+async function cmdTabsCreate({ url }) {
+  if (typeof url !== "string" || !url) {
+    throw new Error("tabs_create: 'url' (string) requis");
+  }
+  const tab = await chrome.tabs.create({ url });
+  await waitForTabComplete(tab.id);
+  return { tab_id: tab.id, url: tab.url || url };
+}
+
+/** Navigue un onglet (ou en crée un) vers `url`. */
+async function cmdGoto({ tab_id, url }) {
+  if (typeof url !== "string" || !url) {
+    throw new Error("goto: 'url' (string) requis");
+  }
+  if (tab_id != null) {
+    await chrome.tabs.update(tab_id, { url });
+    await waitForTabComplete(tab_id);
+    return { tab_id, url };
+  }
+  return cmdTabsCreate({ url });
+}
+
+/** Lit le innerText d'un onglet via scripting.executeScript. */
+async function cmdRead({ tab_id, max_bytes }) {
+  if (tab_id == null) throw new Error("read: 'tab_id' requis");
+  const cap = Number.isFinite(max_bytes) ? max_bytes : READ_MAX_BYTES_DEFAULT;
+  const injection = (cap) => {
+    const full = document.body ? document.body.innerText : "";
+    if (full.length <= cap) return full;
+    return full.slice(0, cap) + "\n[…tronqué à " + cap + " octets]";
+  };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab_id },
+    func: injection,
+    args: [cap],
+  });
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error("read: executeScript n'a rien renvoyé");
+  }
+  const text = results[0].result;
+  if (typeof text !== "string") {
+    throw new Error("read: résultat non-string");
+  }
+  return { text };
+}
+
+/** Clique sur un élément via son sélecteur CSS. */
+async function cmdClick({ tab_id, selector }) {
+  if (tab_id == null) throw new Error("click: 'tab_id' requis");
+  if (typeof selector !== "string" || !selector) {
+    throw new Error("click: 'selector' (string) requis");
+  }
+  const injection = (sel) => {
+    const el = document.querySelector(sel);
+    if (!el) throw new Error("element introuvable: " + sel);
+    el.click();
+    return true;
+  };
+  await chrome.scripting.executeScript({
+    target: { tabId: tab_id },
+    func: injection,
+    args: [selector],
+  });
+  return { clicked: selector };
+}
+
+/** Remplit un input/textarea et déclenche l'event `input`. */
+async function cmdFill({ tab_id, selector, value }) {
+  if (tab_id == null) throw new Error("fill: 'tab_id' requis");
+  if (typeof selector !== "string" || !selector) {
+    throw new Error("fill: 'selector' (string) requis");
+  }
+  if (typeof value !== "string") {
+    throw new Error("fill: 'value' (string) requis");
+  }
+  const injection = (sel, val) => {
+    const el = document.querySelector(sel);
+    if (!el) throw new Error("element introuvable: " + sel);
+    el.focus();
+    el.value = val;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  };
+  await chrome.scripting.executeScript({
+    target: { tabId: tab_id },
+    func: injection,
+    args: [selector, value],
+  });
+  return { filled: selector, length: value.length };
+}
+
+/**
+ * Attend que l'onglet atteigne le statut `complete`. Poll sur
+ * `chrome.tabs.get` (50 ms), timeout 20 s.
+ */
+async function waitForTabComplete(tab_id) {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tab_id);
+    if (tab.status === "complete") return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("waitForTabComplete: timeout 20 s");
+}
 
 // Démarrage initial : on tente une connexion tout de suite. Si le démon est
 // down, le backoff s'enclenche.

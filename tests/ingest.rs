@@ -11,6 +11,7 @@
 //! Implémentation test-first : ce test doit échouer tant que `src/ingest.rs`
 //! et la modif de `src/api.rs` ne sont pas faites.
 
+use dsh_eyes::hands::channel::ExtensionChannel;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::time::Duration;
@@ -44,7 +45,12 @@ async fn ws_accepte_un_evenement_valide() {
     // Construit le router complet (avec /health, /ws, /stats, /events) et
     // spawn le serveur. Task 4 : `api::router` prend un `VigilCtx` agrégé.
     // On n'a pas besoin d'allowlist / session pour ce test — valeurs par défaut.
-    let app = dsh_eyes::api::router(dsh_eyes::state::VigilCtx::new());
+    // REWORK 2026-10-05 : `api::router` prend aussi un `ExtensionChannel`
+    // (extension bidirectionnelle) — on en passe un vide.
+    let app = dsh_eyes::api::router(
+        dsh_eyes::state::VigilCtx::new(),
+        ExtensionChannel::new(),
+    );
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });

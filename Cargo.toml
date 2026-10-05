@@ -15,9 +15,12 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 toml = "1"
 getrandom = "0.2"
-chromiumoxide = "0.9.1"
+# REWORK 2026-10-05 : chromiumoxide retiré. Le modèle "spawn d'un
+# Chrome dédié piloté par CDP" est abandonné au profit du modèle
+# webbridge : l'extension Chrome déjà installée devient bidirectionnelle
+# et exécute elle-même les actions via chrome.tabs et
+# chrome.scripting. Zéro dépendance navigateur côté Rust daemon.
 
 [features]
-# Active un BrowserPool de test (spawn d'un process bidon) sans tirer
-# chromiumoxide, pour valider la logique de cycle de vie en CI headless.
+# Réservé pour de futurs stubs de test (désactivé par défaut).
 test-util = []

@@ -12,6 +12,7 @@
 //! L'ordre des tests `cargo test` n'étant pas garanti, cette approche est
 //! robuste.
 
+use dsh_eyes::hands::channel::ExtensionChannel;
 use dsh_eyes::state::VigilCtx;
 use dsh_eyes::stats::{Counters, DomainCounters};
 use dsh_eyes::vigil::Allowlist;
@@ -36,11 +37,12 @@ async fn stats_reflete_les_evenements_ws() {
 
     // Router complet, câblé avec le contexte agrégé. Task 4 : `api::router`
     // prend un `VigilCtx` ; on injecte directement les compteurs via
-    // `for_tests` (allowlist vide, session vide).
-    let app = dsh_eyes::api::router(VigilCtx::for_tests(
-        counters.clone(),
-        Allowlist::empty(),
-    ));
+    // `for_tests` (allowlist vide, session vide). REWORK 2026-10-05 :
+    // `api::router` prend aussi un `ExtensionChannel`.
+    let app = dsh_eyes::api::router(
+        VigilCtx::for_tests(counters.clone(), Allowlist::empty()),
+        ExtensionChannel::new(),
+    );
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });
@@ -115,10 +117,10 @@ async fn stats_snapshot_vide_quand_rien_ne_passe() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let app = dsh_eyes::api::router(VigilCtx::for_tests(
-        counters.clone(),
-        Allowlist::empty(),
-    ));
+    let app = dsh_eyes::api::router(
+        VigilCtx::for_tests(counters.clone(), Allowlist::empty()),
+        ExtensionChannel::new(),
+    );
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });

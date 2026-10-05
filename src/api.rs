@@ -1,6 +1,7 @@
 //! Router HTTP principal : fusionne `/health`, `/ws`, `/stats`, `/events`.
 //!
-//! Choix d'architecture (Task 3 → Task 4) :
+//! ## Choix d'architecture (Task 3 → Task 4)
+//!
 //! - `VigilCtx` (cf. `state.rs`) agrège `Counters`, `Allowlist`,
 //!   `SharedSession` et `AlertBuffer`. C'est plus simple que de propager
 //!   4 `State<...>` distincts (axum 0.7 n'autorise qu'un `with_state`
@@ -10,11 +11,16 @@
 //! - Les sous-routers `ws_router()`, `stats_router()` ne posent plus
 //!   de `with_state` ; ils lisent l'extension.
 //!
-//! v2 (Task 1) :
-//! - `router_with_v2(ctx, config)` ajoute le sous-router `/v2` **monté
-//!   derrière** `auth::require_token`. Les routes v1 (`/health`, `/ws`,
-//!   `/stats`, `/events`) restent **inchangées et ouvertes**.
+//! ## v2 (Task 1 → REWORK Task 2)
+//!
+//! - `router_with_v2(ctx, config, channel)` ajoute le sous-router `/v2`
+//!   **monté derrière** `auth::require_token`. Les routes v1 (`/health`,
+//!   `/ws`, `/stats`, `/events`) restent **inchangées et ouvertes**.
 //! - Le token est passé au middleware via `Extension(AuthToken(...))`.
+//! - Le `ExtensionChannel` est passé via `Extension(ExtensionChannel)` à
+//!   `/v2/cmd` (POST) — le handler pousse la commande dans le canal et
+//!   attend la réponse de l'extension (modèle webbridge, REWORK Eddie
+//!   2026-10-05).
 //! - `router(ctx)` reste intact pour la compat v1 (signature stable,
 //!   12 tests verts à préserver).
 
@@ -23,14 +29,15 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::auth::{require_token, AuthToken};
 use crate::config::Config;
-use crate::hands::browser::{BrowserPool, BrowserStatus};
+use crate::hands::channel::{CommandError, ExtensionChannel};
 use crate::state::VigilCtx;
 use crate::vigil;
 
@@ -52,59 +59,115 @@ async fn v2_ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-/// Handler `GET /v2/browser/status` — snapshot JSON-safe du pool navigateur.
+/// Corps de la requête `POST /v2/cmd`. Désérialisé en `Value` côté
+/// `params` pour rester agnostique du contenu (le démon ne valide pas
+/// la forme des params — c'est l'affaire de l'extension).
+#[derive(Debug, Deserialize)]
+pub struct CmdRequest {
+    /// Nom de la commande : `goto`, `click`, `read`, `fill`, `tabs_create`, …
+    pub cmd: String,
+    /// Paramètres de la commande (forme libre, validée par l'extension).
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// Réponse uniforme de `POST /v2/cmd`.
+#[derive(Debug, Serialize)]
+pub struct CmdResponse {
+    pub ok: bool,
+    /// Résultat de la commande (forme libre, fournie par l'extension).
+    /// `None` en cas d'erreur.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// Message d'erreur (timeout, pas d'extension, extension a échoué).
+    /// `None` en cas de succès.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Handler `POST /v2/cmd` — modèle webbridge (REWORK).
 ///
-/// Comportement :
-/// - Appelle d'abord `ensure_running()` (idempotent : ne relance que si
-///   crash détecté) — c'est le contrat du brief Task 2 « kill du process
-///   Chrome simulé → ensure_running relance au prochain appel ».
-/// - 200 + `{"running":true,"pages":N,"pid":P}` si Chrome tourne.
-/// - 200 + `{"running":false}` (sans pages ni pid) si le pool n'a pas
-///   pu lancer Chrome (erreur loggée mais on ne fait pas échouer le GET —
-///   sinon un client qui poll le status en boucle pendant un crash
-///   recevrait du 500 spam).
-async fn v2_browser_status(Extension(pool): Extension<BrowserPool>) -> Json<BrowserStatus> {
-    if let Err(e) = pool.ensure_running().await {
-        // Log seulement : on ne fait pas échouer le GET. L'utilisateur
-        // verra `running:false` et pourra diagnostiquer via les logs.
-        tracing::warn!(error = %e, "ensure_running a échoué (status only)");
+/// Flux :
+/// 1. Désérialise `{cmd, params}`.
+/// 2. Pousse la commande dans le `ExtensionChannel` (qui attend la
+///    réponse de l'extension avec timeout 30 s).
+/// 3. Traduit le résultat :
+///    - `Ok(Response)` → 200 + `{ok:true, result:...}`.
+///    - `Err(NoExtension)` → 504 Gateway Timeout (pas d'extension).
+///    - `Err(Timeout(_))` → 504 Gateway Timeout.
+///    - `Err(ChannelClosed)` → 504 Gateway Timeout.
+///    - `Err(ExtensionError(msg))` → 502 Bad Gateway (extension a
+///      renvoyé `ok:false`).
+async fn v2_cmd(
+    Extension(channel): Extension<ExtensionChannel>,
+    Json(req): Json<CmdRequest>,
+) -> impl IntoResponse {
+    match channel.send_command(req.cmd, req.params).await {
+        Ok(resp) => {
+            // resp.ok est toujours true ici (Channel mappe false → Err).
+            let body = CmdResponse {
+                ok: true,
+                result: resp.result,
+                error: None,
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(CommandError::NoExtension) => {
+            tracing::warn!("/v2/cmd refusé : aucune extension connectée");
+            let body = CmdResponse {
+                ok: false,
+                result: None,
+                error: Some("no_extension_connected".into()),
+            };
+            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+        }
+        Err(CommandError::Timeout(d)) => {
+            tracing::warn!(timeout = ?d, "/v2/cmd : timeout en attendant l'extension");
+            let body = CmdResponse {
+                ok: false,
+                result: None,
+                error: Some(format!("extension_timeout_{}s", d.as_secs())),
+            };
+            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+        }
+        Err(CommandError::ChannelClosed) => {
+            tracing::warn!("/v2/cmd : canal oneshot fermé (extension déconnectée)");
+            let body = CmdResponse {
+                ok: false,
+                result: None,
+                error: Some("extension_disconnected".into()),
+            };
+            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+        }
+        Err(CommandError::ExtensionError(msg)) => {
+            tracing::warn!(error = %msg, "/v2/cmd : l'extension a renvoyé ok=false");
+            let body = CmdResponse {
+                ok: false,
+                result: None,
+                error: Some(msg),
+            };
+            (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+        }
     }
-    Json(pool.status().await)
 }
 
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
-/// Le token attendu est transporté par `Extension(AuthToken(...))` posé
-/// sur ce sous-router (pas sur le router racine — ça reste confined à /v2).
-/// Le `BrowserPool` est transporté par `Extension(BrowserPool)` (clone = partage).
-///
-/// Note : on utilise `nest("/v2", ...)` côté `router_with_v2`, donc ici
-/// le sous-router déclare juste `/ping` et `/browser/status` — le préfixe
-/// `/v2` est ajouté par le `nest` à la fusion.
-fn v2_router(token: String, pool: BrowserPool) -> Router {
+fn v2_router(token: String, channel: ExtensionChannel) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
-        .route("/browser/status", get(v2_browser_status))
+        .route("/cmd", post(v2_cmd))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
-        .layer(Extension(pool))
+        .layer(Extension(channel))
 }
 
-/// Nombre max d'alertes servies par `/events` (cf. brief Task 4).
-const EVENTS_TAIL: usize = 50;
-
 /// Handler `GET /events` — retourne les N dernières alertes en JSON.
-///
-/// Priorité de lecture : buffer en mémoire (`ctx.alerts.tail(N)`) — c'est la
-/// source de vérité pour la session courante. Fallback `alerts.jsonl` sur
-/// disque : si le buffer est vide (par ex. daemon fraîchement redémarré)
-/// on relit l'historique persistant des alertes `critical`.
 async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoResponse {
+    const EVENTS_TAIL: usize = 50;
     let from_buffer = ctx.alerts.tail(EVENTS_TAIL).await;
     if !from_buffer.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!(from_buffer))).into_response();
     }
-    // Fallback disque : on lit alerts.jsonl (cf. brief : « 50 dernières
-    // alertes »). `tail_jsonl` gère le cas « fichier absent ».
     let path = match vigil::alerts_path() {
         Ok(p) => p,
         Err(e) => {
@@ -126,31 +189,34 @@ async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoRespons
 }
 
 /// Router principal — fusionne `/health`, `/ws`, `/stats`, `/events`.
-/// **Inchangé** (compat v1 stricte, 12 tests verts à préserver).
-pub fn router(ctx: VigilCtx) -> Router {
+///
+/// **REWORK 2026-10-05** : la signature prend désormais un
+/// `ExtensionChannel` (même si on n'utilise pas /v2) car `/ws` le
+/// référence pour identifier l'extension bidirectionnelle. En v1 pur
+/// (sans REWORK), un `ExtensionChannel::new()` vide suffit — il ne
+/// sera jamais interrogé.
+pub fn router(ctx: VigilCtx, channel: ExtensionChannel) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/events", get(events_handler))
         .merge(crate::ingest::ws_router())
         .merge(crate::stats::stats_router())
+        .layer(Extension(channel))
         .layer(Extension(ctx))
 }
 
 /// Router v1 + sous-router `/v2` protégé par `auth::require_token`.
 ///
-/// Le token est passé via `Extension(AuthToken)` au sous-router /v2 ; le
-/// middleware le lit dans `request.extensions()`. Le `BrowserPool` est
-/// passé via `Extension(BrowserPool)` au sous-router /v2 (handlers comme
-/// `/v2/browser/status` le lisent). Aucune route v1 n'est affectée
-/// (on utilise `nest` + `route_layer` qui confinent le middleware au
-/// sous-arbre /v2).
-///
-/// **Changement Task 2** : la signature prend désormais un `BrowserPool`
-/// en plus du `(ctx, config)`. Le test d'auth Task 1 a été mis à jour en
-/// conséquence (cf. `tests/auth.rs`).
-pub fn router_with_v2(ctx: VigilCtx, config: Config, pool: BrowserPool) -> Router {
-    router(ctx).nest(
+/// Le sous-router /v2 expose `/ping` (trivial) et `/cmd` (POST, modèle
+/// webbridge). Le `channel` est posé à la fois sur le routeur racine
+/// (pour `/ws`) et passé à `v2_router` (pour `/v2/cmd`).
+pub fn router_with_v2(
+    ctx: VigilCtx,
+    config: Config,
+    channel: ExtensionChannel,
+) -> Router {
+    router(ctx, channel.clone()).nest(
         "/v2",
-        v2_router(config.api_token().to_string(), pool),
+        v2_router(config.api_token().to_string(), channel),
     )
 }

@@ -10,6 +10,7 @@
 //!    - example.com (1ère fois) → alerte info (new_domain), non persistée disque
 //! 3. GET /events et vérifie la présence des 3 alertes avec les bons niveaux.
 
+use dsh_eyes::hands::channel::ExtensionChannel;
 use dsh_eyes::state::VigilCtx;
 use dsh_eyes::stats::Counters;
 use dsh_eyes::vigil::Allowlist;
@@ -37,9 +38,10 @@ async fn events_reflete_les_alertes_ws() {
     std::env::set_var("DSH_EYES_HOME", &tmp);
 
     let ctx = VigilCtx::for_tests(Counters::new(), Allowlist::empty());
+    let channel = ExtensionChannel::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let app = dsh_eyes::api::router(ctx);
+    let app = dsh_eyes::api::router(ctx, channel);
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("axum serve");
     });

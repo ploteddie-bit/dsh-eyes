@@ -30,6 +30,13 @@ use std::path::{Path, PathBuf};
 ///
 /// Tous les champs sont publics pour un accès direct ; un builder n'est
 /// pas nécessaire (les défauts sont déjà choisis en dur dans `Default`).
+///
+/// **REWORK 2026-10-05** : `chrome_headless` et `chrome_path` ont été
+/// retirés. Le modèle webbridge n'a plus besoin d'un Chrome dédié
+/// piloté par le daemon — l'extension Chrome de l'utilisateur devient
+/// elle-même les « mains ». Les clés restent **tolérées** dans
+/// `config.toml` (cf. [`ConfigFile`]) pour ne pas casser les fichiers
+/// existants, mais ne sont plus chargées en mémoire.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Token d'API chargé depuis `$DSH_EYES_HOME/token`.
@@ -38,26 +45,27 @@ pub struct Config {
     pub ollama_tier1_url: String,
     /// URL d'Ollama tier 2 (défaut : `http://10.0.0.245:11434`).
     pub ollama_tier2_url: String,
-    /// Active Chrome headless (défaut : `true`).
-    pub chrome_headless: bool,
-    /// Chemin explicite vers le binaire Chrome/Chromium. `None` ⇒ détection
-    /// automatique par chromiumoxide (utilise `which`).
-    pub chrome_path: Option<String>,
 }
 
 /// Représentation sérialisable dans `config.toml`. Pas de `api_token`
 /// ici — le token vit dans son propre fichier (cf. doc de module).
+///
+/// `chrome_headless` et `chrome_path` sont tolérés (lisibles depuis un
+/// ancien `config.toml`) mais **ignorés** : le daemon n'instancie plus
+/// de Chrome. Cf. REWORK 2026-10-05.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
     #[serde(default = "default_ollama_tier1")]
     pub ollama_tier1_url: String,
     #[serde(default = "default_ollama_tier2")]
     pub ollama_tier2_url: String,
-    #[serde(default = "default_chrome_headless")]
-    pub chrome_headless: bool,
-    /// Chemin Chrome explicite (optionnel). Si `None`, chromiumoxide
-    /// détecte via `which google-chrome`/`chromium`/etc.
-    #[serde(default)]
+    /// Toléré pour rétro-compat avec un ancien `config.toml`. Ignoré.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub chrome_headless: Option<bool>,
+    /// Toléré pour rétro-compat avec un ancien `config.toml`. Ignoré.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub chrome_path: Option<String>,
 }
 
@@ -66,9 +74,6 @@ fn default_ollama_tier1() -> String {
 }
 fn default_ollama_tier2() -> String {
     "http://10.0.0.245:11434".to_string()
-}
-fn default_chrome_headless() -> bool {
-    true
 }
 
 impl Config {
@@ -96,8 +101,6 @@ impl Config {
             api_token,
             ollama_tier1_url: cfg_file.ollama_tier1_url,
             ollama_tier2_url: cfg_file.ollama_tier2_url,
-            chrome_headless: cfg_file.chrome_headless,
-            chrome_path: cfg_file.chrome_path,
         })
     }
 
@@ -108,17 +111,19 @@ impl Config {
     }
 
     /// Constructeur pour les tests. Bypass le chargement réel (token
-    /// généré / fichier `config.toml`) — utilise des valeurs passées en
-    /// argument. Le `api_token` vide est OK pour les tests qui ne
-    /// touchent pas l'auth.
-    #[cfg(test)]
-    pub fn for_tests(chrome_headless: bool, chrome_path: Option<String>) -> Self {
+    /// généré / fichier `config.toml`). Le `api_token` vide est OK
+    /// pour les tests qui ne touchent pas l'auth.
+    ///
+    /// Marqué `#[cfg(any(test, feature = "test-util"))]` pour rester
+    /// accessible aux tests d'intégration (`tests/`) sans tirer la
+    /// feature en production.
+    #[cfg(any(test, feature = "test-util"))]
+    #[allow(dead_code)] // utilisé par les tests d'intégration
+    pub fn for_tests() -> Self {
         Self {
             api_token: String::new(),
             ollama_tier1_url: "http://localhost:11434".into(),
             ollama_tier2_url: "http://localhost:11434".into(),
-            chrome_headless,
-            chrome_path,
         }
     }
 }
