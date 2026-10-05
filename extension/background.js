@@ -119,6 +119,25 @@ function connect() {
     connecting = false;
     backoff = BACKOFF_MIN_MS;     // reset du backoff sur succès
     drainQueue();
+    // Keep-alive (REWORK v2.1) : alarme 25 s — réveille le worker AVANT
+    // sa suspension MV3 (~30 s) et maintient la WS ouverte en permanence.
+    chrome.alarms.create("dsh-eyes-keepalive", { periodInMinutes: 0.4 });
+  });
+
+  // Réagit à l'alarme keep-alive : ping WS (ou reconnect si morte).
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== "dsh-eyes-keepalive") return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ ping: Date.now() }));
+      } catch (e) {
+        log("keep-alive : send a échoué, reconnexion :", e && e.message);
+        scheduleReconnect();
+      }
+    } else {
+      log("keep-alive : WS fermée, reconnexion");
+      scheduleReconnect();
+    }
   });
 
   ws.addEventListener("message", (ev) => {
