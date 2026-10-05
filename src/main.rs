@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod hands;
 mod ingest;
+mod solver;
 mod state;
 mod stats;
 mod vigil;

@@ -15,6 +15,14 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 toml = "1"
 getrandom = "0.2"
+# Task 7 — solveur captcha hiérarchisé (Ollama HTTP).
+# `default-features = false` évite openssl (gain de build, pas de
+# dépendance native tierce) ; `json` pour sérialiser les requêtes
+# `{"model":..., "prompt":..., "images":[base64]}` ; `http2` pour la
+# perf face à un Ollama qui parle HTTP/1.1 par défaut — bénéfice
+# marginal ici mais zéro coût. Le TLS n'est pas requis : Ollama est
+# sur le LAN (`10.0.0.223`/`10.0.0.245` en http).
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
 # REWORK 2026-10-05 : chromiumoxide retiré. Le modèle "spawn d'un
 # Chrome dédié piloté par CDP" est abandonné au profit du modèle
 # webbridge : l'extension Chrome déjà installée devient bidirectionnelle

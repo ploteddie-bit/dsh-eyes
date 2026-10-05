@@ -155,7 +155,10 @@ where
 /// Le `Result<Value, Response>` permet au caller d'utiliser `?` ou un
 /// simple `match` pour composer sa réponse. Pas d'`unwrap`/panic : tous
 /// les chemins d'erreur renvoient une `Response` HTTP valide.
-async fn send_cmd(
+///
+/// `pub(crate)` : exposé à [`crate::solver`] pour partager la couche
+/// de transport vers l'extension entre les handlers API et le solveur.
+pub(crate) async fn send_cmd(
     channel: &ExtensionChannel,
     cmd: impl Into<String>,
     params: Value,
@@ -204,7 +207,10 @@ async fn send_cmd(
 /// Helper : construit une `Response` JSON `{ok:false, error}` avec le
 /// statut donné. Utilisé par [`send_cmd`] et par les handlers qui
 /// retournent des erreurs 4xx (400 input invalide, 403 forbidden).
-fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
+///
+/// `pub(crate)` : exposé à [`crate::solver`] pour partager le format
+/// d'erreur entre les handlers API et le solveur.
+pub(crate) fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
     let body = CmdResponse {
         ok: false,
         result: None,
@@ -659,6 +665,11 @@ pub struct CaptchaResponse {
 /// commande `captcha_detect`. La réponse de l'extension
 /// (`{detected, type, selector?, image_b64?}`) est fusionnée dans le
 /// `CaptchaResponse` via `flatten`.
+///
+/// **Task 7** : factorisé autour de [`crate::solver::detect_captcha`]
+/// pour partager la logique avec `POST /v2/page/{id}/solve`. La
+/// sérialisation reste en `flatten` pour préserver la compatibilité
+/// de la réponse publique.
 async fn v2_page_captcha(
     Extension(channel): Extension<ExtensionChannel>,
     body: ValidatedJson<CaptchaRequest>,
@@ -666,12 +677,14 @@ async fn v2_page_captcha(
     let ValidatedJson(Json(req)) = body;
     let params = json!({ "tab_id": req.tab_id });
     log_action("page_captcha", params.clone());
-    match send_cmd(&channel, "captcha_detect", params).await {
-        Ok(result) => {
-            // L'extension renvoie `{detected, type, selector?, image_b64?}`.
-            // On extrait en `serde_json::Map` pour le `flatten`. Si la
-            // forme n'est pas un objet, on retourne une 502 dédiée.
-            let map = match result {
+    match crate::solver::detect_captcha(&channel, req.tab_id).await {
+        crate::solver::DetectOutcome::Info(info) => {
+            // On convertit la `CaptchaInfo` en `serde_json::Map` pour
+            // préserver la forme publique `{detected, type, selector,
+            // image_b64}`. Les champs `None` ne sont pas inclus grâce
+            // au `skip_serializing_if`.
+            let value = serde_json::to_value(&info).unwrap_or(Value::Object(Default::default()));
+            let map = match value {
                 Value::Object(m) => m,
                 _ => {
                     return error_response(
@@ -687,7 +700,7 @@ async fn v2_page_captcha(
             };
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(resp) => resp,
+        crate::solver::DetectOutcome::ErrorResponse(resp) => resp,
     }
 }
 
@@ -729,6 +742,18 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
         .route("/wait", post(v2_wait))
         .route("/page/screenshot", post(v2_page_screenshot))
         .route("/page/captcha", post(v2_page_captcha))
+        // Task 7 : solveur de captcha. Le brief spécifiait
+        // `/v2/page/{id}/solve` mais le `{id}` n'est pas utilisé (le
+        // `tab_id` du body est prioritaire). En axum 0.7 + matchit,
+        // `/page/{id}/solve` peut être capricieux quand des routes
+        // statiques voisines (`/page/captcha`, `/page/screenshot`)
+        // existent — on observe des 404 sur certaines versions de
+        // matchit. On utilise donc une route statique `/page/solve` qui
+        // matche toujours, et on documente la deviation dans le rapport.
+        .route(
+            "/page/solve",
+            post(crate::solver::solve_handler),
+        )
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
         .layer(Extension(channel))

@@ -45,6 +45,8 @@ pub struct Config {
     pub ollama_tier1_url: String,
     /// URL d'Ollama tier 2 (défaut : `http://10.0.0.245:11434`).
     pub ollama_tier2_url: String,
+    /// Modèle vision utilisé par le solveur de captcha (défaut `qwen2.5-vl`).
+    pub vision_model: String,
 }
 
 /// Représentation sérialisable dans `config.toml`. Pas de `api_token`
@@ -59,6 +61,9 @@ pub struct ConfigFile {
     pub ollama_tier1_url: String,
     #[serde(default = "default_ollama_tier2")]
     pub ollama_tier2_url: String,
+    /// Modèle vision pour le solveur de captcha.
+    #[serde(default = "default_vision_model")]
+    pub vision_model: String,
     /// Toléré pour rétro-compat avec un ancien `config.toml`. Ignoré.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -74,6 +79,9 @@ fn default_ollama_tier1() -> String {
 }
 fn default_ollama_tier2() -> String {
     "http://10.0.0.245:11434".to_string()
+}
+fn default_vision_model() -> String {
+    "qwen2.5-vl".to_string()
 }
 
 impl Config {
@@ -101,6 +109,7 @@ impl Config {
             api_token,
             ollama_tier1_url: cfg_file.ollama_tier1_url,
             ollama_tier2_url: cfg_file.ollama_tier2_url,
+            vision_model: cfg_file.vision_model,
         })
     }
 
@@ -114,16 +123,52 @@ impl Config {
     /// généré / fichier `config.toml`). Le `api_token` vide est OK
     /// pour les tests qui ne touchent pas l'auth.
     ///
-    /// Marqué `#[cfg(any(test, feature = "test-util"))]` pour rester
-    /// accessible aux tests d'intégration (`tests/`) sans tirer la
-    /// feature en production.
-    #[cfg(any(test, feature = "test-util"))]
-    #[allow(dead_code)] // utilisé par les tests d'intégration
+    /// Pas de garde `#[cfg(test)]` pour rester accessible aux tests
+    /// d'intégration (`tests/`) — qui ne propagent pas `cfg(test)` au
+    /// crate principal. `#[allow(dead_code)]` masque le warning en
+    /// production (cf. même pattern pour `state::VigilCtx::for_tests`).
+    #[allow(dead_code)]
     pub fn for_tests() -> Self {
         Self {
             api_token: String::new(),
             ollama_tier1_url: "http://localhost:11434".into(),
             ollama_tier2_url: "http://localhost:11434".into(),
+            vision_model: default_vision_model(),
+        }
+    }
+
+    /// Constructeur de test paramétrable : permet aux tests d'intégration
+    /// d'injecter des URLs Ollama mockées (par ex. un mini-serveur axum
+    /// qui répond aux `/api/generate`). Le `vision_model` reste celui par
+    /// défaut (`qwen2.5-vl`) sauf override explicite.
+    ///
+    /// Le `api_token` peut être passé pour les tests qui ont besoin
+    /// de l'auth (sinon toutes les routes protégées renvoient 401 et
+    /// le handler ne pousse jamais la commande vers l'extension —
+    /// symptôme : tests qui timeout au lieu d'échouer proprement).
+    #[allow(dead_code)]
+    pub fn for_tests_with_ollama(tier1_url: impl Into<String>, tier2_url: impl Into<String>) -> Self {
+        Self {
+            api_token: String::new(),
+            ollama_tier1_url: tier1_url.into(),
+            ollama_tier2_url: tier2_url.into(),
+            vision_model: default_vision_model(),
+        }
+    }
+
+    /// Variante complète : token + URLs Ollama. Pour les tests qui
+    /// font de l'auth ET du mock Ollama.
+    #[allow(dead_code)]
+    pub fn for_tests_with_token_and_ollama(
+        api_token: impl Into<String>,
+        tier1_url: impl Into<String>,
+        tier2_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_token: api_token.into(),
+            ollama_tier1_url: tier1_url.into(),
+            ollama_tier2_url: tier2_url.into(),
+            vision_model: default_vision_model(),
         }
     }
 }
