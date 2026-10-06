@@ -415,13 +415,23 @@ pub async fn solve_handler(
     }
 
     // Types image / text / slider : on a besoin d'un image_b64.
+    // Un type détecté sans image exploitable (ex. recaptcha_v2_invisible)
+    // = statut `unsupported` honnête (pas une erreur 502) : le solveur
+    // local ne peut rien en faire.
     let image_b64 = match &info.image_b64 {
         Some(b) if !b.is_empty() => b.clone(),
         _ => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("extension_returned_no_image_for_type_{}", info.r#type),
-            );
+            return (
+                StatusCode::OK,
+                Json(SolveResponse {
+                    status: "unsupported".to_string(),
+                    r#type: Some(info.r#type.clone()),
+                    answer: None,
+                    applied: false,
+                    tier_used: None,
+                }),
+            )
+                .into_response();
         }
     };
 
