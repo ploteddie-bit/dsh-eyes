@@ -369,19 +369,67 @@ async function dispatchCommand(cmd, params) {
 }
 
 /** Ouvre un onglet et attend la fin du chargement. */
+/**
+ * Déduplication : cherche un onglet existant pointant sur la même page
+ * (origine + chemin identiques — query, hash et slash final ignorés).
+ * Retourne l'onglet trouvé ou null.
+ */
+async function findTabByUrl(url) {
+	let target;
+	try {
+		target = new URL(url);
+	} catch {
+		return null;
+	}
+	const norm = (p) => p.replace(/\/+$/, "").toLowerCase();
+	const tabs = await chrome.tabs.query({});
+	return (
+		tabs.find((t) => {
+			if (!t.url) return false;
+			try {
+				const u = new URL(t.url);
+				return (
+					u.origin === target.origin &&
+					norm(u.pathname) === norm(target.pathname)
+				);
+			} catch {
+				return false;
+			}
+		}) ?? null
+	);
+}
+
 async function cmdTabsCreate({ url }) {
   if (typeof url !== "string" || !url) {
     throw new Error("tabs_create: 'url' (string) requis");
   }
+  // Déduplication (retour Eddie) : onglet identique déjà ouvert → focus
+  // au lieu de créer un doublon.
+  const existing = await findTabByUrl(url);
+  if (existing) {
+    await chrome.tabs.update(existing.id, { active: true });
+    await waitForTabComplete(existing.id);
+    return { tab_id: existing.id, url: existing.url || url, reused: true };
+  }
   const tab = await chrome.tabs.create({ url });
   await waitForTabComplete(tab.id);
-  return { tab_id: tab.id, url: tab.url || url };
+  return { tab_id: tab.id, url: tab.url || url, reused: false };
 }
 
 /** Navigue un onglet (ou en crée un) vers `url`. */
 async function cmdGoto({ tab_id, url }) {
   if (typeof url !== "string" || !url) {
     throw new Error("goto: 'url' (string) requis");
+  }
+  // Sans tab_id explicite : déduplication d'abord, création ensuite.
+  if (tab_id === undefined) {
+    const existing = await findTabByUrl(url);
+    if (existing) {
+      await chrome.tabs.update(existing.id, { active: true });
+      if (existing.url !== url) await chrome.tabs.update(existing.id, { url });
+      await waitForTabComplete(existing.id);
+      return { tab_id: existing.id, url, reused: true };
+    }
   }
   if (tab_id != null) {
     await chrome.tabs.update(tab_id, { url });
