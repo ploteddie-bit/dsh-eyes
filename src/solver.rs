@@ -377,6 +377,7 @@ pub async fn solve_handler(
         }
     };
     let tab_id = req.tab_id;
+    crate::api::log_action("solve", serde_json::json!({ "tab_id": tab_id }));
 
     // 1. Détection.
     let info = match detect_captcha(&channel, tab_id).await {

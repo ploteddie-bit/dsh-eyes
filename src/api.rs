@@ -241,8 +241,8 @@ pub fn actions_jsonl_path() -> PathBuf {
 /// « toute action est loggée »). Fire-and-forget : l'échec d'écriture est
 /// loggé mais ne fait jamais échouer l'action métier.
 ///
-/// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd","detail":{…}}`
-fn log_action(action: &str, detail: Value) {
+/// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd|solve","detail":{…}}`
+pub(crate) fn log_action(action: &str, detail: Value) {
     // Chemin capturé UNE SEULE FOIS au premier log (OnceLock process-wide) :
     // les tests qui modifient DSH_EYES_HOME en parallèle ne font plus
     // varier le dossier entre le moment de l'appel et l'écriture async.
