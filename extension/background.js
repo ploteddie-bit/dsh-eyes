@@ -21,6 +21,13 @@
 
 const WS_URL = "ws://127.0.0.1:8445/ws";
 
+// v2.1 — couche de comportement humain (port ghost-cursor).
+import { humanMousePath, humanTypingPlan } from "./humanize-math.js";
+
+// Dernière position de curseur connue par onglet (les injections de
+// trajectoire démarrent d'ici — jamais du même point deux fois de suite).
+const cursorState = new Map(); // tab_id → {x, y}
+
 // Bornes de la file FIFO mémoire (brief : max 1000 événements si le démon
 // est injoignable). Au-delà, perte assumée + log dans la console worker.
 const QUEUE_MAX = 1000;
@@ -425,27 +432,134 @@ async function resolveTabId(tab_id) {
   return tabs[0].id;
 }
 
-/** Clique sur un élément via son sélecteur CSS. */
-async function cmdClick({ tab_id, selector }) {
-  if (typeof selector !== "string" || !selector) {
-    throw new Error("click: 'selector' (string) requis");
-  }
-  const real_tab_id = await resolveTabId(tab_id);
-  const injection = (sel) => {
-    const el = document.querySelector(sel);
-    if (!el) throw new Error("sélecteur introuvable: " + sel);
-    el.click();
-    return true;
-  };
-  await chrome.scripting.executeScript({
-    target: { tabId: real_tab_id },
-    func: injection,
-    args: [selector],
-  });
-  return { clicked: selector };
+/**
+ * Injecté dans la page : rejoue une trajectoire souris humaine (points
+ * {x,y,delayMs} en coordonnées viewport), puis survole + clique l'élément
+ * ciblé avec hésitation pré-clic. Auto-contenu (aucune closure externe).
+ */
+async function replayMousePathInPage(points, selector) {
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+	const dispatch = (type, x, y, target) => {
+		const el = target || document.elementFromPoint(x, y) || document.documentElement;
+		el.dispatchEvent(
+			new MouseEvent(type, {
+				bubbles: true,
+				cancelable: true,
+				view: window,
+				clientX: x,
+				clientY: y,
+				button: 0,
+			}),
+		);
+	};
+	for (const p of points) {
+		if (p.delayMs) await sleep(p.delayMs);
+		dispatch("mousemove", p.x, p.y);
+	}
+	const el = document.querySelector(selector);
+	if (!el) throw new Error("sélecteur introuvable: " + selector);
+	const r = el.getBoundingClientRect();
+	const cx = Math.round(r.x + r.width / 2);
+	const cy = Math.round(r.y + r.height / 2);
+	el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, clientX: cx, clientY: cy }));
+	await sleep(60 + Math.random() * 90); // hésitation pré-clic
+	el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: cx, clientY: cy }));
+	await sleep(40 + Math.random() * 60);
+	el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: cx, clientY: cy }));
+	el.dispatchEvent(
+		new MouseEvent("click", { bubbles: true, cancelable: true, clientX: cx, clientY: cy }),
+	);
+	return { moves: points.length, selector };
 }
 
-/** Remplit un input/textarea et déclenche l'event `input`. */
+/**
+ * Injecté dans la page : frappe clavier humaine caractère par caractère
+ * selon le plan {type:'char'|'backspace', ch, delayMs}. Compatible React
+ * (setter natif + event input). Auto-contenu.
+ */
+async function replayTypingInPage(plan, selector) {
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+	const el = document.querySelector(selector);
+	if (!el) throw new Error("sélecteur introuvable: " + selector);
+	el.focus();
+	const setter = Object.getOwnPropertyDescriptor(
+		el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+		"value",
+	)?.set;
+	let value = "";
+	const key = (type, ch) => {
+		if (ch) el.dispatchEvent(new KeyboardEvent(type, { key: ch, bubbles: true }));
+		else el.dispatchEvent(new KeyboardEvent(type, { bubbles: true }));
+	};
+	for (const step of plan) {
+		await sleep(step.delayMs);
+		if (step.type === "backspace") {
+			value = value.slice(0, -1);
+			key("keydown", "Backspace");
+			if (setter) setter.call(el, value);
+			else el.value = value;
+			el.dispatchEvent(new Event("input", { bubbles: true }));
+			key("keyup", "Backspace");
+		} else {
+			value += step.ch;
+			key("keydown", step.ch);
+			key("keypress", step.ch);
+			if (setter) setter.call(el, value);
+			else el.value = value;
+			el.dispatchEvent(new Event("input", { bubbles: true }));
+			key("keyup", step.ch);
+		}
+	}
+	el.dispatchEvent(new Event("change", { bubbles: true }));
+	return { length: value.length };
+}
+
+/** Clique sur un élément via son sélecteur CSS — trajectoire humaine (v2.1). */
+async function cmdClick({ tab_id, selector }) {
+	if (typeof selector !== "string" || !selector) {
+		throw new Error("click: 'selector' (string) requis");
+	}
+	const real_tab_id = await resolveTabId(tab_id);
+
+	// 1) Centre de la cible (après scrollIntoView centre).
+	const [rectRes] = await chrome.scripting.executeScript({
+		target: { tabId: real_tab_id },
+		func: (sel) => {
+			const el = document.querySelector(sel);
+			if (!el) throw new Error("sélecteur introuvable: " + sel);
+			el.scrollIntoView({ block: "center" });
+			const r = el.getBoundingClientRect();
+			return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+		},
+		args: [selector],
+	});
+	const target = rectRes.result;
+
+	// 2) Trajectoire humaine depuis la dernière position de curseur connue.
+	const from = cursorState.get(real_tab_id) ?? {
+		x: 80 + Math.random() * 1000,
+		y: 120 + Math.random() * 400,
+	};
+	const { points, overshoot } = humanMousePath(from, target);
+
+	// 3) Replay dans la page (mouvements + hover + clic avec hésitation).
+	const [replayRes] = await chrome.scripting.executeScript({
+		target: { tabId: real_tab_id },
+		func: replayMousePathInPage,
+		args: [points, selector],
+	});
+
+	// 4) Mémorise la position finale pour la prochaine trajectoire.
+	cursorState.set(real_tab_id, { x: target.x, y: target.y });
+	return {
+		clicked: selector,
+		moves: points.length,
+		overshoot,
+		replay: replayRes.result,
+	};
+}
+
+/** Remplit un input/textarea — frappe clavier humaine char par char (v2.1). */
 async function cmdFill({ tab_id, selector, value }) {
   if (typeof selector !== "string" || !selector) {
     throw new Error("fill: 'selector' (string) requis");
@@ -454,21 +568,35 @@ async function cmdFill({ tab_id, selector, value }) {
     throw new Error("fill: 'value' (string) requis");
   }
   const real_tab_id = await resolveTabId(tab_id);
-  const injection = (sel, val) => {
-    const el = document.querySelector(sel);
-    if (!el) throw new Error("sélecteur introuvable: " + sel);
-    el.focus();
-    el.value = val;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return true;
-  };
+
+  // 1) Focus + scrollIntoView centre (préparation humaine).
   await chrome.scripting.executeScript({
     target: { tabId: real_tab_id },
-    func: injection,
-    args: [selector, value],
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) throw new Error("sélecteur introuvable: " + sel);
+      el.scrollIntoView({ block: "center" });
+      el.focus();
+    },
+    args: [selector],
   });
-  return { filled: selector, length: value.length };
+
+  // 2) Plan de frappe humain (typos + backspaces + délais lognormaux).
+  const plan = humanTypingPlan(value, { typoRate: 0.03 });
+
+  // 3) Replay dans la page (frappe char par char, compatible React).
+  const [replayRes] = await chrome.scripting.executeScript({
+    target: { tabId: real_tab_id },
+    func: replayTypingInPage,
+    args: [plan, selector],
+  });
+
+  return {
+    filled: selector,
+    length: value.length,
+    keystrokes: plan.length,
+    replay: replayRes.result,
+  };
 }
 
 /**
