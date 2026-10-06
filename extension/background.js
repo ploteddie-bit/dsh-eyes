@@ -86,8 +86,6 @@ function drainQueue() {
       queue.shift();
     } catch (e) {
       log("drain: send a échoué, on reconnecte :", e && e.message);
-      enqueue(queue.shift()); // re-pousse en queue (en tête, puis on sortira)
-      // Ré-empile correctement : on a shift+retour, donc on remet à l'index 0.
       scheduleReconnect();
       return;
     }

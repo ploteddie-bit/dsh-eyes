@@ -280,7 +280,13 @@ pub fn is_forbidden_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // Normalise IPv4-mapped IPv6 (::ffff:127.0.0.1 → 127.0.0.1) avant le
+    // parse, sinon la forme mappée échappe aux règles loopback/RFC1918.
+    let normalized = host
+        .strip_prefix("::ffff:")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| host.to_string());
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
         return is_loopback(&ip) || is_private_rfc1918(&ip);
     }
     false

@@ -195,9 +195,16 @@ pub(crate) async fn send_cmd(
         }
         Err(CommandError::ExtensionError(msg)) => {
             // Sélecteur introuvable → 404 (ressource ciblée inexistante),
-            // les autres erreurs extension restent en 502.
+            // wait_timeout → 504 (cohérent avec les autres timeouts du
+            // canal), les autres erreurs extension restent en 502.
             if msg.starts_with("sélecteur introuvable") {
                 return Err(error_response(StatusCode::NOT_FOUND, msg));
+            }
+            if msg.starts_with("wait_timeout:") {
+                return Err(error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "extension_wait_timeout",
+                ));
             }
             tracing::warn!(error = %msg, "send_cmd : l'extension a renvoyé ok=false");
             Err(error_response(StatusCode::BAD_GATEWAY, msg))

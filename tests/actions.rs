@@ -696,11 +696,8 @@ async fn wait_502_wait_timeout_extension() {
     // `send_cmd` dans src/api.rs). Le contrat HTTP est "la commande a
     // été exécutée par l'extension, elle a renvoyé ok=false".
     let (status, body) = post_task.await.expect("post_task join");
-    assert_eq!(status, 502, "wait_timeout → 502 (body={body})");
-    assert_eq!(
-        body["error"],
-        "wait_timeout: '#never' introuvable après 500 ms"
-    );
+    assert_eq!(status, 504, "wait_timeout → 504 harmonisé (body={body})");
+    assert_eq!(body["error"], "extension_wait_timeout");
 
     let _ = ws_tx.send(Message::Close(None)).await;
 }
