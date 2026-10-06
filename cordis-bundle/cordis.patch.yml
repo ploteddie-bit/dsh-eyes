@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-eyes
+      name: '@local/dsh-eyes'
+      config: {}
