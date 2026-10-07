@@ -119,6 +119,125 @@ async fn ws_accepte_un_evenement_valide() {
     server.abort();
 }
 
+/// Lot A — D1 : 100 événements rapides via WS → flush EventWriter
+/// (toutes les 10 lignes OU 500 ms d'idle) → les 100 lignes sont
+/// dans `events.jsonl` après la fermeture de la WS.
+///
+/// Test-first discriminant :
+/// 1. Envoie 5 events (sous le seuil de 10 et sous 500 ms) → le
+///    fichier doit être VIDE : la bufferisation est en cours.
+/// 2. Ferme la WS → flush final → les 5 events sont dans le fichier.
+///
+/// Avec l'ancienne impl (OpenOptions + flush par event), l'étape 1
+/// échoue : le fichier contient déjà les 5 lignes. Avec l'EventWriter
+/// (Lot A), les deux étapes passent.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ws_bufferise_100_evenements_dans_events_jsonl() {
+    let _guard = common::env_guard();
+
+    // Dossier temporaire pour la persistance — isolé du test 1
+    // (env_guard ci-dessus assure la sérialisation).
+    let tmp = tempdir_in_tests_target();
+    std::env::set_var("DSH_EYES_HOME", &tmp);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind 127.0.0.1:0");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let app = dsh_eyes::api::router(
+        dsh_eyes::state::VigilCtx::new(),
+        ExtensionChannel::new(),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("axum serve");
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let (stream, _response) =
+        tokio_tungstenite::connect_async(&url).await.expect("connect_async WS");
+    let (mut ws_tx, mut ws_rx) = stream.split();
+
+    // Envoie 100 événements le plus vite possible (fire-and-forget
+    // côté serveur : on n'attend pas les acks).
+    const N: usize = 100;
+    for i in 0..N {
+        let evt = json!({
+            "ts": i as u64,
+            "domain": format!("example{}.com", i),
+            "url": format!("https://example{}.com/", i),
+            "kind": "request",
+            "bytes": i as u64,
+        });
+        ws_tx
+            .send(Message::Text(evt.to_string()))
+            .await
+            .expect("send text");
+    }
+
+    // Consomme les N acks {"ok":true} dans la limite du timeout.
+    for i in 0..N {
+        let reply_msg = tokio::time::timeout(TEST_TIMEOUT, ws_rx.next())
+            .await
+            .unwrap_or_else(|_| panic!("ack {i} timeout"))
+            .unwrap_or_else(|| panic!("ack {i} stream fermé"))
+            .expect("message WS");
+        match reply_msg {
+            Message::Text(t) => assert_eq!(t.to_string(), r#"{"ok":true}"#, "ack {i}"),
+            other => panic!("réponse inattendue ack {i}: {other:?}"),
+        }
+    }
+
+    // Assertion 1 — bufferisation observable : juste après l'envoi
+    // des 100 events et la réception des 100 acks, le fichier NE
+    // DOIT PAS contenir toutes les lignes. Avec un EventWriter
+    // (flush toutes les 10 lignes ou 500 ms idle), on a au plus ~10
+    // lignes flushées au moment des acks ; avec l'ancienne impl
+    // (OpenOptions + flush par event), le fichier contient 100
+    // lignes. Cette assertion discrimine les deux implémentations.
+    let jsonl_path = tmp.join("events.jsonl");
+    let body = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
+    let count_after_acks = body.lines().filter(|l| !l.is_empty()).count();
+    assert!(
+        count_after_acks < N,
+        "EventWriter doit bufferiser (attendu < {N} lignes immédiatement après acks, \
+         observé {count_after_acks}). L'implémentation flush probablement à chaque event."
+    );
+
+    // Ferme proprement la WS → le serveur sort de la boucle, drop la
+    // sender de l'EventWriter, la task écrivain flush final + exit.
+    let _ = ws_tx.send(Message::Close(None)).await;
+
+    // Attente : WS fermée → drop sender → canal fermé côté écrivain
+    // → flush final. Marge 1,5 s (500 ms flush + cycle + marge OS).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Assertion 2 — garantie de persistance : tous les events
+    // sont bien là après la fermeture (pas d'événement perdu).
+    let body = std::fs::read_to_string(&jsonl_path).expect("lecture events.jsonl");
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        N,
+        "attendu {N} lignes après flush final, lu {} :\n{}",
+        lines.len(),
+        body
+    );
+
+    // Vérifie le contenu (chaque ligne a un domain unique).
+    let mut domains = std::collections::HashSet::new();
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line).expect("JSONL valide");
+        let d = v["domain"].as_str().expect("domain string").to_string();
+        domains.insert(d);
+    }
+    assert_eq!(domains.len(), N, "tous les domains doivent être uniques");
+
+    // Stoppe le serveur.
+    server.abort();
+}
+
 /// Crée un répertoire temporaire sous le dossier `target/`, qui est
 /// nettoyé par cargo lors d'un `cargo clean`. Suffisant pour ce test :
 /// on n'a pas besoin d'un vrai tmp externe.

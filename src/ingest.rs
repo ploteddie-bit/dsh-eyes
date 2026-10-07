@@ -43,6 +43,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 
@@ -93,6 +94,124 @@ impl Ack {
 enum Outbound {
     Text(String),
     Pong(Vec<u8>),
+}
+
+/// Seuil de flush en nombre de lignes accumulées dans le
+/// `BufWriter` interne. Au-delà, un `flush()` est forcé.
+const EVENT_WRITER_FLUSH_LINES: usize = 10;
+
+/// Idle maximum toléré avant qu'un `flush()` idle soit déclenché.
+const EVENT_WRITER_FLUSH_IDLE: Duration = Duration::from_millis(500);
+
+/// Écrivain JSONL bufferisé — dédie une tâche tokio à l'écriture
+/// des [`NavEvent`] dans un fichier append-unique ouvert une seule
+/// fois pour toute la durée de la connexion WS.
+///
+/// # Stratégie (D1 — Lot A 2026-10-07)
+///
+/// - Canal `mpsc::unbounded` : `append` est fire-and-forget (jamais
+///   d'échec bloquant pour l'appelant — un canal saturé est un
+///   *bug* investigué, pas un cas attendu).
+/// - Tâche écrivain propriétaire d'un `BufWriter<File>` ouvert en
+///   append. Flush forcé toutes les [`EVENT_WRITER_FLUSH_LINES`]
+///   lignes OU après [`EVENT_WRITER_FLUSH_IDLE`] d'idle (via
+///   `tokio::time::timeout` autour de `recv`).
+/// - À la fermeture du canal (sender droppée) : flush final + exit
+///   propre. `handle_socket` attend la `JoinHandle` avant de
+///   retourner, garantissant 0 événement perdu.
+pub struct EventWriter {
+    tx: mpsc::UnboundedSender<NavEvent>,
+}
+
+impl EventWriter {
+    /// Démarre la tâche écrivain. Retourne le handle fire-and-forget
+    /// et la `JoinHandle` de la tâche — le caller doit `await` la
+    /// `JoinHandle` après `drop` du writer pour garantir le flush
+    /// final.
+    pub fn start(path: PathBuf) -> (Self, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::unbounded_channel::<NavEvent>();
+        let join = tokio::spawn(writer_loop(path, rx));
+        (Self { tx }, join)
+    }
+
+    /// Fire-and-forget : ne bloque jamais l'appelant. Si le canal
+    /// est saturé (jamais attendu en pratique) ou fermé (writer
+    /// terminé), l'événement est silencieusement perdu.
+    pub fn append(&self, evt: NavEvent) {
+        // `send` ne bloque pas (unbounded). Une erreur indique un
+        // canal fermé : la tâche écrivain s'est arrêtée
+        // (probablement erreur d'ouverture au démarrage). On log
+        // au niveau debug, pas warn, car c'est attendu en cas
+        // d'erreur d'I/O au boot.
+        if self.tx.send(evt).is_err() {
+            tracing::debug!("EventWriter: canal fermé, événement perdu");
+        }
+    }
+}
+
+async fn writer_loop(path: PathBuf, mut rx: mpsc::UnboundedReceiver<NavEvent>) {
+    let file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "EventWriter: ouverture impossible");
+            // Drain silencieux des events reçus pour libérer le canal
+            // sans bloquer les appelants. On retourne ensuite.
+            while rx.recv().await.is_some() {}
+            return;
+        }
+    };
+    let mut bw = tokio::io::BufWriter::with_capacity(8 * 1024, file);
+
+    let mut since_flush: usize = 0;
+    loop {
+        match tokio::time::timeout(EVENT_WRITER_FLUSH_IDLE, rx.recv()).await {
+            Ok(Some(evt)) => {
+                let mut line = match serde_json::to_vec(&evt) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "EventWriter: sérialisation échouée");
+                        continue;
+                    }
+                };
+                line.push(b'\n');
+                if let Err(e) = bw.write_all(&line).await {
+                    tracing::warn!(error = %e, "EventWriter: write_all échoué");
+                    continue;
+                }
+                since_flush += 1;
+                if since_flush >= EVENT_WRITER_FLUSH_LINES {
+                    if let Err(e) = bw.flush().await {
+                        tracing::warn!(error = %e, "EventWriter: flush périodique échoué");
+                    }
+                    since_flush = 0;
+                }
+            }
+            Ok(None) => {
+                // Canal fermé : flush final + sortie.
+                if let Err(e) = bw.flush().await {
+                    tracing::warn!(error = %e, "EventWriter: flush final échoué");
+                }
+                break;
+            }
+            Err(_timeout) => {
+                // Idle 500 ms atteint : flush si quelque chose est
+                // en attente.
+                if since_flush > 0 {
+                    if let Err(e) = bw.flush().await {
+                        tracing::warn!(error = %e, "EventWriter: flush idle échoué");
+                    }
+                    since_flush = 0;
+                }
+            }
+        }
+    }
+    // `bw` (BufWriter) est droppé ici, ce qui ferme le fichier
+    // proprement (flush résiduel + close).
 }
 
 /// Handler axum : upgrade la requête HTTP en WebSocket et délègue à [`handle_socket`].
@@ -216,6 +335,13 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
             return;
         }
     };
+    // EventWriter : bufferise l'écriture JSONL (D1 — Lot A 2026-10-07).
+    // Tâche écrivain propriétaire du fichier ouvert en append + un
+    // BufWriter. `append` est fire-and-forget. Le JoinHandle est
+    // attendu à la sortie de `handle_socket` pour garantir le
+    // flush final (sender droppée → canal fermé → writer fait
+    // `Ok(None)` → flush final + exit).
+    let (event_writer, writer_task) = EventWriter::start(events_path);
     let alerts_path = match vigil::alerts_path() {
         Ok(p) => p,
         Err(e) => {
@@ -262,18 +388,15 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
                             }
                         }
                         ctx.counters.record_async(&evt.domain, evt.bytes).await;
-                        match append_event(&events_path, &evt).await {
-                            Ok(()) => {
-                                if !send_text(&local_tx, Ack::ok()) {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "échec persistance JSONL");
-                                if !send_text(&local_tx, Ack::err(format!("io: {e}"))) {
-                                    break;
-                                }
-                            }
+                        // D1 — Lot A : `append` est fire-and-forget.
+                        // On ack tout de suite à l'extension (le
+                        // contrat historique) ; l'écriture réelle
+                        // est différée jusqu'au flush suivant
+                        // (10 lignes ou 500 ms idle) ou jusqu'au
+                        // flush final à la fermeture de la WS.
+                        event_writer.append(evt);
+                        if !send_text(&local_tx, Ack::ok()) {
+                            break;
                         }
                     }
                     Err(e) => {
@@ -300,12 +423,20 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
     }
 
     // Fermeture : on désenregistre le sink (purge les requêtes en
-    // attente) et on ferme les deux tasks (bridge + pump) en droppant
-    // les senders.
+    // attente), on ferme les deux tasks (bridge + pump) en droppant
+    // les senders, et on attend la fin de la tâche écrivain
+    // (EventWriter) pour garantir le flush final (0 event perdu).
     channel.unregister(&handle).await;
     drop(local_tx);
     let _ = pump_task.await;
     let _ = bridge_task.await;
+    // `event_writer` est droppé implicitement à la sortie de scope
+    // (sender fermée → task écrivain voit `Ok(None)` → flush final).
+    // `writer_task` est joinée après le drop.
+    drop(event_writer);
+    if let Err(e) = writer_task.await {
+        tracing::warn!(error = %e, "EventWriter: join final a échoué");
+    }
     // `handle` est droppé en sortie de scope.
     let _ = handle;
 }
@@ -331,20 +462,6 @@ fn default_home() -> std::io::Result<PathBuf> {
         std::io::ErrorKind::NotFound,
         "ni HOME ni USERPROFILE défini",
     ))
-}
-
-async fn append_event(path: &std::path::Path, evt: &NavEvent) -> std::io::Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    let mut buf = serde_json::to_vec(evt)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    buf.push(b'\n');
-    file.write_all(&buf).await?;
-    file.flush().await?;
-    Ok(())
 }
 
 async fn append_alert(path: &std::path::Path, alert: &Alert) -> std::io::Result<()> {
