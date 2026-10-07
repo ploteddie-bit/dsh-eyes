@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::{error_response, send_cmd};
-use crate::config::Config;
+use crate::config::SolverConfig;
 use crate::hands::channel::ExtensionChannel;
 
 /// Représentation normalisée du résultat de détection captcha (handler
@@ -200,18 +200,24 @@ pub struct OllamaError {
 }
 
 impl OllamaClient {
-    /// Construit un client Ollama à partir de la config runtime. Pas de
+    /// Construit un client Ollama à partir de la config solveur
+    /// ([`SolverConfig`]) injectée via `Extension` axum. Pas de
     /// validation des URLs ici — un format incorrect sera détecté au
     /// premier appel HTTP (erreur réseau reportée par reqwest).
-    pub fn new(config: &Config) -> Self {
+    ///
+    /// **Lot B — D2 (2026-10-07)** : on n'utilise plus `&Config` (qui
+    /// contient aussi le `api_token` qu'on ne veut pas dupliquer dans
+    /// le handler). La [`SolverConfig`] est le sous-ensemble strict
+    /// nécessaire au solveur.
+    pub fn new(solver: &SolverConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(OLLAMA_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            tier1_url: config.ollama_tier1_url.clone(),
-            tier2_url: config.ollama_tier2_url.clone(),
-            model: config.vision_model.clone(),
+            tier1_url: solver.tier1.clone(),
+            tier2_url: solver.tier2.clone(),
+            model: solver.model.clone(),
             http,
         }
     }
@@ -220,15 +226,15 @@ impl OllamaClient {
     /// pour les tests d'intégration qui ne veulent pas attendre 60 s
     /// même si la performance est rapide).
     #[allow(dead_code)]
-    pub fn new_with_timeout(config: &Config, timeout: std::time::Duration) -> Self {
+    pub fn new_with_timeout(solver: &SolverConfig, timeout: std::time::Duration) -> Self {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            tier1_url: config.ollama_tier1_url.clone(),
-            tier2_url: config.ollama_tier2_url.clone(),
-            model: config.vision_model.clone(),
+            tier1_url: solver.tier1.clone(),
+            tier2_url: solver.tier2.clone(),
+            model: solver.model.clone(),
             http,
         }
     }
@@ -365,6 +371,7 @@ async fn try_apply_text_solution(
 /// 4. Réponse unifiée [`SolveResponse`].
 pub async fn solve_handler(
     Extension(channel): Extension<ExtensionChannel>,
+    Extension(solver_config): Extension<SolverConfig>,
     body: Result<Json<SolveRequest>, JsonRejection>,
 ) -> Response {
     // On accepte les deux formes : `Json<SolveRequest>` ou rejet
@@ -435,41 +442,18 @@ pub async fn solve_handler(
         }
     };
 
-    // 3. Solveur Ollama. Config injectée via Task : on lit la config
-    // depuis l'environnement process (DSH_EYES_HOME) — ou on accepte
-    // une injection via un futur middleware. Pour Task 7, on suit le
-    // pattern existant : on instancie un client à la demande via
-    // [`OllamaClient::new`] en lisant la config via
-    // [`Config::load`].
+    // 3. Solveur Ollama. La config (URLs + modèle) est injectée
+    // via `Extension(SolverConfig)` depuis `router_with_v2` — pas de
+    // lecture disque par requête, plus de `spawn_blocking` sur le
+    // chemin chaud.
     //
-    // ⚠️ Note 1 : `Config::load()` est **synchrone** (I/O disque).
-    // On l'exécute via `tokio::task::spawn_blocking` pour ne pas
-    // bloquer le runtime tokio mono-thread des tests
-    // (`#[tokio::test]` utilise le flavor `current_thread` par
-    // défaut). En prod multi-thread le coût serait négligeable, mais
-    // spawn_blocking est plus correct.
-    //
-    // ⚠️ Note 2 : un appel Config::load() par requête /solve est
-    // coûteux (lecture disque). On lira la config une fois et on la
-    // stockera dans le state — Task 8 refactoring probable.
-    let config = match tokio::task::spawn_blocking(Config::load).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "Config::load a échoué pendant /solve");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config_load_failed",
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "spawn_blocking(Config::load) a paniqué");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config_load_panicked",
-            );
-        }
-    };
-    let client = OllamaClient::new(&config);
+    // **Lot B — D2 (2026-10-07)** : on supprime le
+    // `tokio::task::spawn_blocking(Config::load)` qui était coûteux
+    // (I/O synchrone) et serialisait inutilement les requêtes
+    // concurrentes sur le même pool blocking. Le client HTTP
+    // `reqwest` interne est lui-même un pool réutilisable, donc
+    // aucune perte de performance.
+    let client = OllamaClient::new(&solver_config);
     let (answer, tier) = match client.solve(&image_b64).await {
         Ok(v) => v,
         Err(e) => {

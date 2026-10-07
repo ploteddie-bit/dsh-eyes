@@ -49,6 +49,23 @@ pub struct Config {
     pub vision_model: String,
 }
 
+/// Sous-ensemble de [`Config`] utile au solveur de captcha. Extrait
+/// par [`Config::solver_config`] et injecté via `Extension` axum
+/// dans le `solve_handler` — fini le `Config::load()` à chaque requête.
+///
+/// **Lot B — D2 (2026-10-07)** : la `SolverConfig` est volontairement
+/// minimale (3 champs, tous des `String` clonés). Le handler n'a pas
+/// besoin du token d'API (l'auth est gérée par le middleware
+/// `require_token` en amont) ni des autres champs éventuels. Léger
+/// à cloner / à transporter via `Extension` axum (les `String` sont
+/// trois pointeurs + len + cap).
+#[derive(Debug, Clone)]
+pub struct SolverConfig {
+    pub tier1: String,
+    pub tier2: String,
+    pub model: String,
+}
+
 /// Représentation sérialisable dans `config.toml`. Pas de `api_token`
 /// ici — le token vit dans son propre fichier (cf. doc de module).
 ///
@@ -119,6 +136,22 @@ impl Config {
         &self.api_token
     }
 
+    /// Extrait le sous-ensemble utile au solveur de captcha. Appelé
+    /// **une fois** dans `router_with_v2` (à la construction du router)
+    /// puis injecté via `Extension(SolverConfig)` dans le handler
+    /// `/v2/page/solve`. Évite un `Config::load()` par requête.
+    ///
+    /// Le clone est intentionnel : `SolverConfig` est léger (3 strings),
+    /// et le router doit pouvoir la transporter sans partager une
+    /// référence sur la `Config` d'origine (qui vit dans `main`).
+    pub fn solver_config(&self) -> SolverConfig {
+        SolverConfig {
+            tier1: self.ollama_tier1_url.clone(),
+            tier2: self.ollama_tier2_url.clone(),
+            model: self.vision_model.clone(),
+        }
+    }
+
     /// Constructeur pour les tests. Bypass le chargement réel (token
     /// généré / fichier `config.toml`). Le `api_token` vide est OK
     /// pour les tests qui ne touchent pas l'auth.
@@ -160,6 +193,30 @@ impl Config {
     /// font de l'auth ET du mock Ollama.
     #[allow(dead_code)]
     pub fn for_tests_with_token_and_ollama(
+        api_token: impl Into<String>,
+        tier1_url: impl Into<String>,
+        tier2_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_token: api_token.into(),
+            ollama_tier1_url: tier1_url.into(),
+            ollama_tier2_url: tier2_url.into(),
+            vision_model: default_vision_model(),
+        }
+    }
+
+    /// Constructeur de test orienté solveur : token + URLs Ollama mockées.
+    ///
+    /// **Lot B — D2 (2026-10-07)** : remplace l'ancien pattern
+    /// « écrire un `config.toml` + appel `Config::load()` » pour
+    /// démarrer le serveur de test. Le serveur pointe directement
+    /// vers les URLs passées en argument, plus de fichier sur disque,
+    /// plus de race condition entre tests parallèles sur `config.toml`.
+    ///
+    /// Le `vision_model` reste celui par défaut (`qwen2.5-vl`) — les
+    /// tests mockent Ollama avec un handler qui ignore ce champ.
+    #[allow(dead_code)]
+    pub fn for_tests_with_solver(
         api_token: impl Into<String>,
         tier1_url: impl Into<String>,
         tier2_url: impl Into<String>,

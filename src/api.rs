@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::auth::{require_token, AuthToken};
-use crate::config::Config;
+use crate::config::{Config, SolverConfig};
 use crate::hands::channel::{CommandError, ExtensionChannel};
 use crate::state::VigilCtx;
 use crate::vigil;
@@ -784,7 +784,12 @@ fn extract_host(url: &str) -> Option<String> {
 }
 
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
-fn v2_router(token: String, channel: ExtensionChannel) -> Router {
+///
+/// **Lot B — D2 (2026-10-07)** : la `SolverConfig` (URLs Ollama +
+/// modèle vision) est passée en paramètre puis injectée via
+/// `Extension(SolverConfig)` pour que `solve_handler` la lise sans
+/// avoir à recharger `Config` à chaque requête. Cf. [`SolverConfig`].
+fn v2_router(token: String, solver_config: SolverConfig, channel: ExtensionChannel) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
         .route("/cmd", post(v2_cmd))
@@ -811,6 +816,7 @@ fn v2_router(token: String, channel: ExtensionChannel) -> Router {
         )
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
+        .layer(Extension(solver_config))
         .layer(Extension(channel))
 }
 
@@ -872,6 +878,14 @@ pub fn router_with_v2(
 ) -> Router {
     router(ctx, channel.clone()).nest(
         "/v2",
-        v2_router(config.api_token().to_string(), channel),
+        v2_router(
+            config.api_token().to_string(),
+            // **Lot B — D2 (2026-10-07)** : on extrait le sous-ensemble
+            // solveur (URLs + modèle) une seule fois à la construction
+            // du router, puis `v2_router` l'injecte via `Extension`
+            // pour que `solve_handler` n'ait plus à recharger la config.
+            config.solver_config(),
+            channel,
+        ),
     )
 }
