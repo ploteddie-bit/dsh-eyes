@@ -686,7 +686,8 @@ async fn ollama_client_solve_cascade() {
     let mock = MockOllama::new("ok", "ok", "DIRECT_TEST_ANSWER");
     let (url1, url2, _state, _server) = start_mock_ollama(mock.clone()).await;
     let cfg = Config::for_tests_with_ollama(url1, url2);
-    let client = OllamaClient::new_with_timeout(&cfg, Duration::from_secs(5));
+    let solver_cfg = cfg.solver_config();
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
     let (answer, tier) = client.solve("IMAGE_B64_FAKE").await.expect("solve OK");
     assert_eq!(answer, "DIRECT_TEST_ANSWER");
     assert_eq!(tier, 1, "tier 1 doit réussir en premier");
@@ -701,7 +702,8 @@ async fn ollama_client_cascade_tier1_fail() {
     let mock = MockOllama::new("error", "ok", "TIER2_ANSWER");
     let (url1, url2, _state, _server) = start_mock_ollama(mock.clone()).await;
     let cfg = Config::for_tests_with_ollama(url1, url2);
-    let client = OllamaClient::new_with_timeout(&cfg, Duration::from_secs(5));
+    let solver_cfg = cfg.solver_config();
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
     let (answer, tier) = client.solve("IMAGE").await.expect("solve OK après fallback");
     assert_eq!(answer, "TIER2_ANSWER");
     assert_eq!(tier, 2);
@@ -716,7 +718,8 @@ async fn ollama_client_both_tiers_fail() {
     let mock = MockOllama::new("error", "error", "");
     let (url1, url2, _state, _server) = start_mock_ollama(mock.clone()).await;
     let cfg = Config::for_tests_with_ollama(url1, url2);
-    let client = OllamaClient::new_with_timeout(&cfg, Duration::from_secs(5));
+    let solver_cfg = cfg.solver_config();
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
     let err = client.solve("IMAGE").await.expect_err("doit échouer");
     assert!(
         err.tier1_err.contains("HTTP status 500") || err.tier1_err.contains("HTTP error"),
@@ -742,7 +745,8 @@ async fn ollama_client_empty_response_is_error() {
     let mock = MockOllama::new_split("empty", "ok", "", "TIER2_VALID");
     let (url1, url2, _state, _server) = start_mock_ollama(mock.clone()).await;
     let cfg = Config::for_tests_with_ollama(url1, url2);
-    let client = OllamaClient::new_with_timeout(&cfg, Duration::from_secs(5));
+    let solver_cfg = cfg.solver_config();
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
     let (answer, tier) = client.solve("IMAGE").await.expect("doit tomber sur tier 2");
     assert_eq!(answer, "TIER2_VALID");
     assert_eq!(tier, 2);
