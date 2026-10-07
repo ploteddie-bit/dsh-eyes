@@ -21,6 +21,14 @@ use dsh_eyes::vigil::{Alert, AlertLevel, AlertRule, Allowlist, SessionState};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+// Mutex global pour sérialiser les tests qui partagent `DSH_EYES_HOME`
+// (variable d'environnement du process). Cf. `tests/common/mod.rs` — on
+// importe le module par `path` (pas `mod common { include! }` qui ne
+// compile pas à cause d'un `use` orphelin dans le mod parent).
+#[path = "common/mod.rs"]
+mod common;
+use common::env_guard;
+
 /// Construit un `NavEvent` minimal pour les tests.
 fn evt(domain: &str) -> NavEvent {
     NavEvent {
@@ -113,4 +121,139 @@ async fn vigil_alert_serialization_shape() {
     assert_eq!(v["level"], "critical");
     assert_eq!(v["rule"], "localhost_access");
     assert_eq!(v["detail"], "127.0.0.1");
+}
+
+// =====================================================================
+// Lot C — D4 : hot-reload de l'allowlist par mtime
+//
+// Les 2 tests suivants valident le contrat de
+// `Allowlist::reload_if_changed` (cf. `src/vigil.rs`) :
+// 1. Édition du fichier `allowlist.json` (mtime + nouveau domaine) →
+//    rechargement automatique : la nouvelle entrée n'est plus considérée
+//    comme « nouveau domaine » par `vigil::check` après `reload_if_changed`.
+// 2. Fichier supprimé entre deux ticks → `reload_if_changed` vide
+//    l'allowlist sans paniquer (dégradation gracieuse, jamais de panic).
+//
+// Ces tests partagent `DSH_EYES_HOME` (variable d'environnement du
+// process) — l'`env_guard` les sérialise pour éviter qu'un test concurrent
+// ne modifie le même répertoire temporaire.
+// =====================================================================
+
+/// Prépare un répertoire temporaire sous `/tmp/dsh-eyes-allowlist-<label>`
+/// et l'exporte comme `DSH_EYES_HOME`. Le `MutexGuard` retourné par
+/// `env_guard()` est rendu pour que l'appelant le maintienne jusqu'à la
+/// fin du test (les tests `reload_*` sont donc mutuellement exclusifs).
+fn setup_temp_home(label: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let dir = std::path::PathBuf::from(format!(
+        "/tmp/dsh-eyes-allowlist-{label}-{pid}-{n}"
+    ));
+    // Nettoyage préventif (un test précédent peut avoir planté).
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir temp DSH_EYES_HOME");
+    // `set_var` est `unsafe` depuis Rust 1.74 pour signaler la race
+    // théorique ; ici on l'isole par le `MutexGuard` de `env_guard`.
+    unsafe { std::env::set_var("DSH_EYES_HOME", &dir) };
+    let guard = env_guard();
+    (dir, guard)
+}
+
+/// Écrit un allowlist JSON d'un ou plusieurs domaines dans
+/// `<home>/allowlist.json`.
+fn write_allowlist(home: &std::path::Path, domains: &[&str]) {
+    let payload = serde_json::json!({ "domains": domains });
+    std::fs::write(
+        home.join("allowlist.json"),
+        serde_json::to_string_pretty(&payload).expect("serialize allowlist"),
+    )
+    .expect("write allowlist.json");
+}
+
+/// Test 1 — modification du fichier (mtime + nouveau domaine) :
+/// après `reload_if_changed`, le nouveau domaine n'est plus signalé
+/// `new_domain` par `vigil::check`. C'est le scénario « édition manuelle
+/// prise en compte sans restart ».
+// `allow(await_holding_lock)` : le `MutexGuard` de `env_guard()` est tenu
+// pendant les `.await` du test, mais il sert exclusivement à sérialiser
+// les tests qui partagent `DSH_EYES_HOME` — il n'est pas un garde de
+// données async. Le relâcher entre chaque await compliquerait le test
+// sans bénéfice (les autres tests ne pourraient pas entrer en course
+// tant que le répertoire temp n'est pas nettoyé par le test driver).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn vigil_reload_if_changed_prend_en_compte_les_editions() {
+    let (home, _guard) = setup_temp_home("edit");
+
+    // 1) Premier chargement : allowlist contient `github.com` uniquement.
+    write_allowlist(&home, &["github.com"]);
+    let allow = Allowlist::load_or_default();
+    assert!(
+        allow.contains("github.com"),
+        "github.com doit être chargé au démarrage"
+    );
+    assert!(
+        !allow.contains("fresh.example.org"),
+        "fresh.example.org n'est pas encore dans l'allowlist"
+    );
+
+    // 2) Avant reload : `fresh.example.org` est « nouveau ».
+    let session = Arc::new(Mutex::new(SessionState::new()));
+    let alert = dsh_eyes::vigil::check(&evt("fresh.example.org"), &allow, &session).await;
+    assert!(
+        matches!(
+            alert.as_ref().map(|a| (a.level, a.rule)),
+            Some((AlertLevel::Info, AlertRule::NewDomain))
+        ),
+        "avant reload, fresh.example.org doit déclencher new_domain ; got={alert:?}"
+    );
+
+    // 3) Édition du fichier (nouvelle entrée + garantit un mtime différent
+    //    : la résolution mtime est la seconde sur certains FS — on attend
+    //    1,1 s pour être robuste sur ext4/NTFS/FAT).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write_allowlist(&home, &["github.com", "fresh.example.org"]);
+
+    // 4) Hot-reload : le clone du `Allowlist` (Arc intérieur) partage
+    //    l'état ; `reload_if_changed` mute l'Arc partagé en place.
+    allow.reload_if_changed().await;
+
+    // 5) Après reload : `fresh.example.org` n'est plus « nouveau » —
+    //    aucune alerte `new_domain`.
+    let session2 = Arc::new(Mutex::new(SessionState::new()));
+    let alert2 = dsh_eyes::vigil::check(&evt("fresh.example.org"), &allow, &session2).await;
+    assert!(
+        alert2.is_none(),
+        "après reload, fresh.example.org est allowlisté : pas d'alerte ; got={alert2:?}"
+    );
+}
+
+/// Test 2 — fichier supprimé entre deux ticks :
+/// `reload_if_changed` vide l'allowlist sans paniquer.
+// Cf. note sur `await_holding_lock` du test 1 ci-dessus — même raison :
+// `env_guard()` n'est qu'un sérialiseur, pas un garde de données async.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn vigil_reload_if_changed_fichier_absent_allowlist_vide() {
+    let (home, _guard) = setup_temp_home("absent");
+
+    // 1) Premier chargement avec un fichier existant.
+    write_allowlist(&home, &["github.com"]);
+    let allow = Allowlist::load_or_default();
+    assert!(allow.contains("github.com"));
+
+    // 2) Suppression du fichier (simule « Eddie a effacé l'allowlist »).
+    std::fs::remove_file(home.join("allowlist.json"))
+        .expect("rm allowlist.json");
+
+    // 3) Hot-reload : doit dégrader gracieusement vers vide, sans panic.
+    allow.reload_if_changed().await;
+
+    // 4) L'allowlist est désormais vide.
+    assert!(
+        !allow.contains("github.com"),
+        "après suppression du fichier, github.com ne doit plus être dans l'allowlist"
+    );
 }
