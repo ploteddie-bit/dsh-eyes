@@ -116,7 +116,7 @@ impl Allowlist {
             path: None,
         };
         Self {
-            inner: Arc::new(Mutex::new(core)),
+            inner: Arc::new(StdMutex::new(core)),
         }
     }
 
