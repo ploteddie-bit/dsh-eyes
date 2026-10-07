@@ -119,21 +119,25 @@ async fn ws_accepte_un_evenement_valide() {
     server.abort();
 }
 
-/// Lot A — D1 : 100 événements rapides via WS → flush EventWriter
-/// (toutes les 10 lignes OU 500 ms d'idle) → les 100 lignes sont
-/// dans `events.jsonl` après la fermeture de la WS.
+/// Lot A — D1 : bufferisation de `append_event` (EventWriter).
 ///
-/// Test-first discriminant :
-/// 1. Envoie 5 events (sous le seuil de 10 et sous 500 ms) → le
-///    fichier doit être VIDE : la bufferisation est en cours.
-/// 2. Ferme la WS → flush final → les 5 events sont dans le fichier.
+/// Test discriminant en deux phases :
+/// 1. **Bufferisation observable** : envoyer 5 événements (< seuil
+///    de 10 lignes, < 500 ms d'idle) puis attendre 200 ms. Le
+///    fichier DOIT être VIDE : la bufferisation est en cours et
+///    aucun flush (ni périodique 10 lignes, ni idle 500 ms) n'a
+///    été déclenché. Avec l'ancienne impl (OpenOptions + flush
+///    par event), les 5 lignes seraient déjà sur disque.
+/// 2. **Garantie de persistance** : fermer la WS, attendre le
+///    flush final propre (drop sender → canal fermé → writer
+///    termine avec flush), puis vérifier que les 5 événements
+///    sont bien tous présents dans le fichier.
 ///
-/// Avec l'ancienne impl (OpenOptions + flush par event), l'étape 1
-/// échoue : le fichier contient déjà les 5 lignes. Avec l'EventWriter
-/// (Lot A), les deux étapes passent.
+/// Avec l'EventWriter (Lot A), les deux phases passent. Avec
+/// l'ancienne impl, la phase 1 échoue (fichier non vide).
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn ws_bufferise_100_evenements_dans_events_jsonl() {
+async fn ws_bufferise_5_evenements_observables_et_persistes() {
     let _guard = common::env_guard();
 
     // Dossier temporaire pour la persistance — isolé du test 1
@@ -159,9 +163,10 @@ async fn ws_bufferise_100_evenements_dans_events_jsonl() {
         tokio_tungstenite::connect_async(&url).await.expect("connect_async WS");
     let (mut ws_tx, mut ws_rx) = stream.split();
 
-    // Envoie 100 événements le plus vite possible (fire-and-forget
-    // côté serveur : on n'attend pas les acks).
-    const N: usize = 100;
+    // Envoie 5 événements (< 10 lignes, < 500 ms). On consomme les
+    // 5 acks pour garantir qu'ils ont atteint la `event_writer`
+    // (sinon l'ack partirait avant que l'event soit dans le mpsc).
+    const N: usize = 5;
     for i in 0..N {
         let evt = json!({
             "ts": i as u64,
@@ -175,13 +180,11 @@ async fn ws_bufferise_100_evenements_dans_events_jsonl() {
             .await
             .expect("send text");
     }
-
-    // Consomme les N acks {"ok":true} dans la limite du timeout.
     for i in 0..N {
         let reply_msg = tokio::time::timeout(TEST_TIMEOUT, ws_rx.next())
             .await
             .unwrap_or_else(|_| panic!("ack {i} timeout"))
-            .unwrap_or_else(|| panic!("ack {i} stream fermé"))
+            .expect("stream non vide")
             .expect("message WS");
         match reply_msg {
             Message::Text(t) => assert_eq!(t.to_string(), r#"{"ok":true}"#, "ack {i}"),
@@ -189,32 +192,31 @@ async fn ws_bufferise_100_evenements_dans_events_jsonl() {
         }
     }
 
-    // Assertion 1 — bufferisation observable : juste après l'envoi
-    // des 100 events et la réception des 100 acks, le fichier NE
-    // DOIT PAS contenir toutes les lignes. Avec un EventWriter
-    // (flush toutes les 10 lignes ou 500 ms idle), on a au plus ~10
-    // lignes flushées au moment des acks ; avec l'ancienne impl
-    // (OpenOptions + flush par event), le fichier contient 100
-    // lignes. Cette assertion discrimine les deux implémentations.
+    // Phase 1 — bufferisation observable : 200 ms < 500 ms (idle
+    // non déclenché) et N=5 < 10 (seuil périodique non déclenché).
+    // Le fichier DOIT être vide : la bufferisation est en cours.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let jsonl_path = tmp.join("events.jsonl");
-    let body = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
-    let count_after_acks = body.lines().filter(|l| !l.is_empty()).count();
-    assert!(
-        count_after_acks < N,
-        "EventWriter doit bufferiser (attendu < {N} lignes immédiatement après acks, \
-         observé {count_after_acks}). L'implémentation flush probablement à chaque event."
+    let body_phase1 = std::fs::read_to_string(&jsonl_path).unwrap_or_default();
+    let count_phase1 = body_phase1.lines().filter(|l| !l.is_empty()).count();
+    assert_eq!(
+        count_phase1, 0,
+        "EventWriter doit bufferiser (attendu 0 ligne à t+200ms, \
+         observé {count_phase1}). L'implémentation flush probablement \
+         à chaque event."
     );
 
-    // Ferme proprement la WS → le serveur sort de la boucle, drop la
-    // sender de l'EventWriter, la task écrivain flush final + exit.
+    // Ferme proprement la WS → le serveur sort de la boucle, drop
+    // la sender de l'EventWriter, la task écrivain fait son flush
+    // final puis exit.
     let _ = ws_tx.send(Message::Close(None)).await;
 
     // Attente : WS fermée → drop sender → canal fermé côté écrivain
     // → flush final. Marge 1,5 s (500 ms flush + cycle + marge OS).
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    // Assertion 2 — garantie de persistance : tous les events
-    // sont bien là après la fermeture (pas d'événement perdu).
+    // Phase 2 — garantie de persistance : tous les events sont
+    // là après la fermeture (0 event perdu).
     let body = std::fs::read_to_string(&jsonl_path).expect("lecture events.jsonl");
     let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(
