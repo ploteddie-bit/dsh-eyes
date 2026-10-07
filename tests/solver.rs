@@ -26,13 +26,16 @@
 //! Pour Ollama, on ajoute `start_mock_ollama` qui binde un axum-router
 //! sur un port libre et retourne son URL.
 //!
-//! ## Pourquoi Config::for_tests_with_ollama
+//! ## Pourquoi Config::for_tests_with_solver
 //!
-//! `Config::load()` lit `config.toml` sur disque — inacceptable pour
-//! des tests où on veut injecter des URLs dynamiques. Le constructeur
-//! `for_tests_with_ollama` (cfg test-util, donc visible aux tests
-//! d'intégration) permet de pointer tier 1 / tier 2 vers les mocks
-//! sans toucher au filesystem.
+//! `Config::load()` lisait `config.toml` sur disque à chaque requête
+//! `POST /v2/page/solve` (via le `spawn_blocking` du handler). **Lot B
+//! — D2 (2026-10-07)** : la config est désormais injectée via
+//! `Extension(SolverConfig)`. Côté test, on utilise
+//! `Config::for_tests_with_solver(token, url1, url2)` pour démarrer le
+//! serveur sans toucher au filesystem. Plus de `DSH_EYES_HOME` partagé
+//! entre tests, plus de `config.toml` à écrire, plus de `Config::load`
+//! synchrone.
 
 use axum::{response::IntoResponse as _, routing::post as axum_post, Json, Router};
 use dsh_eyes::config::Config;
@@ -53,11 +56,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 mod common;
 
-// Sérialisation des tests solver entre eux : ils partagent
-// `DSH_EYES_HOME` (variable d'env process-globale), `config.toml`
-// (lu par Config::load dans le solve_handler) et le port éphémère.
-// Sans sérialisation, deux tests en parallèle se marchent dessus
-// (symptôme : tier1 reçu avec la réponse d'un autre test, ou 401).
+// Sérialisation des tests solver entre eux : ils partagent le port
+// éphémère (la sélection de port via `bind("127.0.0.1:0")` est unique
+// par appel, mais les mocks Ollama + le serveur HTTP peuvent collisionner
+// si on les lance en parallèle). Sans sérialisation, deux tests en
+// parallèle se marchent dessus (symptôme : tier1 reçu avec la réponse
+// d'un autre test).
+//
+// **Lot B — D2 (2026-10-07)** : on ne partage plus `DSH_EYES_HOME` ni
+// `config.toml` (le harnais utilise `for_tests_with_solver` en mémoire).
+// Le `solver_lock` reste pour la course sur le port éphémère des mocks.
 //
 // On utilise un tokio::Mutex statique : les tests `#[tokio::test]`
 // sont async, donc un std::sync::Mutex ne bloque pas entre awaits.
@@ -241,33 +249,16 @@ async fn start_server_with_urls(
     tier2_url: String,
 ) -> (String, SocketAddr, ExtensionChannel, tokio::task::JoinHandle<()>) {
     let _guard = common::env_guard();
-    let tmp = tempdir_in_tests_target();
-    std::env::set_var("DSH_EYES_HOME", &tmp);
-
-    // Écrit un `config.toml` dans le home de test AVANT le démarrage
-    // du serveur. `Config::load()` lit ce fichier dans le solve_handler
-    // pour récupérer les URLs Ollama — sans ça, le handler utilise les
-    // défauts prod (10.0.0.223) et ne parle jamais à nos mocks.
-    let toml = format!(
-        r#"ollama_tier1_url = "{tier1_url}"
-ollama_tier2_url = "{tier2_url}"
-vision_model = "qwen2.5-vl"
-"#
-    );
-    std::fs::write(tmp.join("config.toml"), toml).expect("write config.toml");
-    // Écrit aussi le fichier `token` pour que `Config::load` l'utilise
-    // au lieu d'en générer un nouveau. Sinon le serveur a un token
-    // aléatoire et le test envoie un token connu → 401.
-    let token = "a".repeat(64);
-    std::fs::write(tmp.join("token"), &token).expect("write token");
+    // **Lot B — D2 (2026-10-07)** : le `solve_handler` ne lit plus la
+    // config à chaque requête, on construit la `Config` en mémoire
+    // via `for_tests_with_solver` (token + URLs Ollama). L'écriture
+    // de `config.toml` et du fichier `token` est supprimée — plus de
+    // race condition entre tests parallèles sur le filesystem, plus
+    // de `Config::load` synchrone au démarrage du serveur.
 
     // Token en dur pour les tests : 64 chars hex comme en prod.
-    // Écrit ci-dessus dans le fichier `token`. `Config::load` le
-    // lira et le réutilisera. Sans ça, le serveur génère un token
-    // aléatoire → Bearer client = 401.
     let token = "a".repeat(64);
-    // Charge la config qui pointe vers les mocks.
-    let cfg = Config::load().expect("Config::load");
+    let cfg = Config::for_tests_with_solver(&token, &tier1_url, &tier2_url);
     let ctx = VigilCtx::for_tests(Counters::new(), Allowlist::empty());
     let channel = ExtensionChannel::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -345,20 +336,6 @@ async fn open_fake_extension(
         "l'extension doit être enregistrée après l'ouverture WS"
     );
     (rx, tx)
-}
-
-fn tempdir_in_tests_target() -> std::path::PathBuf {
-    let base = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let dir = base.join("target").join("tests-tmp").join(format!(
-        "solver-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).expect("create tests-tmp dir");
-    dir
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
