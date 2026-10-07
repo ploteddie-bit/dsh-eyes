@@ -109,6 +109,7 @@ impl Allowlist {
     /// Construit une allowlist à partir d'un `Vec<String>`.
     /// Utilisé par les tests et par le chargement initial. Le `path` est
     /// `None` : ces allowlists ne sont **pas** hot-reloadables (no-op).
+    #[allow(dead_code)] // API publique réservée aux tests (`tests/vigil.rs`).
     pub fn from_vec(domains: Vec<String>) -> Self {
         let core = AllowlistCore {
             domains: domains.into_iter().collect(),
@@ -199,6 +200,7 @@ impl Allowlist {
     ///
     /// `async` par cohérence avec le reste du code (la tâche de reload
     /// tourne dans un `tokio::spawn`).
+    #[allow(dead_code)] // câblage dans `main.rs` hors Lot C (cf. `spawn_reload_task`).
     pub async fn reload_if_changed(&self) {
         // On capture le path + le mtime mémorisé sous un premier lock court,
         // puis on effectue l'I/O **hors lock** (le lock n'est pas async, on
@@ -288,6 +290,7 @@ impl Allowlist {
     /// extension (cf. `chore(extension): version 0.2.1`). On aligne le
     /// tick de reload sur la même granularité pour rester sous le seuil
     /// de perception humaine (< 30 s) sans surcharger le disque.
+    #[allow(dead_code)] // câblage dans `main.rs` hors Lot C (cf. note ci-dessus).
     pub fn spawn_reload_task(self) {
         const RELOAD_INTERVAL: Duration = Duration::from_secs(25);
         tokio::spawn(async move {
