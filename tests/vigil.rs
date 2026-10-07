@@ -142,9 +142,14 @@ async fn vigil_alert_serialization_shape() {
 /// Prépare un répertoire temporaire sous `/tmp/dsh-eyes-allowlist-<label>`
 /// et l'exporte comme `DSH_EYES_HOME`. Le `MutexGuard` retourné par
 /// `env_guard()` est rendu pour que l'appelant le maintienne jusqu'à la
-/// fin du test (les tests `reload_*` sont donc mutuellement exclusifs).
+/// fin du test (les tests `reload_*` sont donc mutuellement exclusifs —
+/// c'est l'`env_guard` global partagé avec `endpoints.rs`).
 fn setup_temp_home(label: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
     use std::sync::atomic::{AtomicU64, Ordering};
+    // On prend le `env_guard` **AVANT** toute opération mutable sur
+    // l'env du process — sinon 2 tests parallèles qui appellent
+    // `set_var` sans tenir le guard pourraient se chevaucher.
+    let guard = env_guard();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
@@ -157,7 +162,6 @@ fn setup_temp_home(label: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'s
     // `set_var` est `unsafe` depuis Rust 1.74 pour signaler la race
     // théorique ; ici on l'isole par le `MutexGuard` de `env_guard`.
     unsafe { std::env::set_var("DSH_EYES_HOME", &dir) };
-    let guard = env_guard();
     (dir, guard)
 }
 
