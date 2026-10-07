@@ -12,6 +12,10 @@ mod vigil;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let ctx = state::VigilCtx::new();
+    // Hot-reload allowlist (Lot C — D4) : la tâche re-vérifie le mtime de
+    // allowlist.json toutes les 25 s — les éditions manuelles sont prises
+    // en compte sans restart du démon.
+    vigil::Allowlist::spawn_reload_task(ctx.allowlist.clone());
     let config = config::Config::load()?;
     tracing::info!(
         ollama_tier1 = %config.ollama_tier1_url,
