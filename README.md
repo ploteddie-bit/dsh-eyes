@@ -81,6 +81,28 @@ Données runtime écrites dans `~/.dsh-eyes/` :
 - `token` — token Bearer pour /v2 (chmod 600, généré au 1er run)
 - `config.toml` — options non sensibles
 
+## Solveur de captcha — cascade à deux tiers
+
+Le solveur (`POST /v2/page/solve`) interroge les endpoints Ollama dans
+l'ordre `ollama_tier1_url` → `ollama_tier2_url`, puis rend la main
+(`human_required`) si les deux échouent. Chaque tier peut exiger un jeton :
+
+| Clé `config.toml` | Sens |
+|---|---|
+| `ollama_tier1_url` / `ollama_tier2_url` | base Ollama ; `/api/generate` est appelé |
+| `ollama_tier1_token_file` / `ollama_tier2_token_file` | fichier contenant le jeton envoyé en `Authorization: Bearer` (chemin absolu, ou résolu sous `$DSH_EYES_HOME`). Vide ou fichier absent → tier appelé sans authentification |
+| `vision_model` | modèle vision (défaut `qwen2.5-vl`) |
+
+Le secret ne vit jamais dans `config.toml` : le fichier de jeton doit être
+en `chmod 600`. Ce mécanisme rend le routeur IAQ exploitable — il répond
+`401` à `/api/generate` sans jeton.
+
+Preuve automatisée (réseau local requis, test ignoré par défaut) :
+
+```bash
+cargo test --test solver -- --ignored live_iaq_token_accepted
+```
+
 ## Recharger l'extension Chrome après mise à jour
 
 1. Va sur `chrome://extensions/`.
