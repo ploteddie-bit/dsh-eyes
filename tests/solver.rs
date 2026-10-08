@@ -37,8 +37,8 @@
 //! entre tests, plus de `config.toml` à écrire, plus de `Config::load`
 //! synchrone.
 
-use axum::{response::IntoResponse as _, routing::post as axum_post, Json, Router};
-use dsh_eyes::config::Config;
+use axum::{http::HeaderMap, response::IntoResponse as _, routing::post as axum_post, Json, Router};
+use dsh_eyes::config::{Config, SolverConfig};
 use dsh_eyes::hands::channel::ExtensionChannel;
 use dsh_eyes::solver::OllamaClient;
 use dsh_eyes::state::VigilCtx;
@@ -94,6 +94,10 @@ struct MockOllama {
     /// Compteur d'appels reçus par tier.
     tier1_calls: Arc<AtomicU16>,
     tier2_calls: Arc<AtomicU16>,
+    /// Dernier en-tête `authorization` reçu par le tier 1 (None = absent).
+    tier1_auth: Arc<std::sync::Mutex<Option<String>>>,
+    /// Dernier en-tête `authorization` reçu par le tier 2 (None = absent).
+    tier2_auth: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOllama {
@@ -117,6 +121,8 @@ impl MockOllama {
             tier2_response: Arc::new(std::sync::Mutex::new(tier2_response.to_string())),
             tier1_calls: Arc::new(AtomicU16::new(0)),
             tier2_calls: Arc::new(AtomicU16::new(0)),
+            tier1_auth: Arc::new(std::sync::Mutex::new(None)),
+            tier2_auth: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -136,6 +142,16 @@ impl MockOllama {
     fn tier2_calls(&self) -> u16 {
         self.tier2_calls.load(Ordering::SeqCst)
     }
+
+    /// Dernier en-tête `authorization` vu par le tier 1.
+    fn tier1_auth(&self) -> Option<String> {
+        self.tier1_auth.lock().unwrap().clone()
+    }
+
+    /// Dernier en-tête `authorization` vu par le tier 2.
+    fn tier2_auth(&self) -> Option<String> {
+        self.tier2_auth.lock().unwrap().clone()
+    }
 }
 
 /// Démarre un mock Ollama qui répond aux requêtes `/api/generate` selon
@@ -151,9 +167,9 @@ async fn start_mock_ollama(state: MockOllama) -> (String, String, MockOllama, to
     let addr1 = listener1.local_addr().expect("addr1");
     let app1 = Router::new().route(
         "/api/generate",
-        axum_post(move |Json(_body): Json<Value>| {
+        axum_post(move |headers: HeaderMap, Json(_body): Json<Value>| {
             let s = s1.clone();
-            async move { handle_generate(s, "tier1").await }
+            async move { handle_generate(s, "tier1", headers).await }
         }),
     );
     let server1 = tokio::spawn(async move {
@@ -166,9 +182,9 @@ async fn start_mock_ollama(state: MockOllama) -> (String, String, MockOllama, to
     let addr2 = listener2.local_addr().expect("addr2");
     let app2 = Router::new().route(
         "/api/generate",
-        axum_post(move |Json(_body): Json<Value>| {
+        axum_post(move |headers: HeaderMap, Json(_body): Json<Value>| {
             let s = s2.clone();
-            async move { handle_generate(s, "tier2").await }
+            async move { handle_generate(s, "tier2", headers).await }
         }),
     );
     let server2 = tokio::spawn(async move {
@@ -191,12 +207,24 @@ async fn start_mock_ollama(state: MockOllama) -> (String, String, MockOllama, to
 /// Handler unique pour les deux tiers. Lit le comportement dans
 /// `state`, incrémente le compteur, et renvoie la réponse HTTP
 /// appropriée.
-async fn handle_generate(state: MockOllama, tier: &str) -> axum::response::Response {
+async fn handle_generate(
+    state: MockOllama,
+    tier: &str,
+    headers: HeaderMap,
+) -> axum::response::Response {
     let (behavior, calls, response) = if tier == "tier1" {
         (state.tier1_behavior.clone(), &state.tier1_calls, state.tier1_response.clone())
     } else {
         (state.tier2_behavior.clone(), &state.tier2_calls, state.tier2_response.clone())
     };
+    // Capture de l'en-tête d'authentification : c'est ce que vérifient les
+    // tests de jeton (ia-general répond 401 sans Bearer).
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let auth_slot = if tier == "tier1" { &state.tier1_auth } else { &state.tier2_auth };
+    *auth_slot.lock().unwrap() = auth;
     calls.fetch_add(1, Ordering::SeqCst);
     let behavior_str = behavior.lock().unwrap().clone();
     match behavior_str.as_str() {
@@ -727,4 +755,90 @@ async fn ollama_client_empty_response_is_error() {
     let (answer, tier) = client.solve("IMAGE").await.expect("doit tomber sur tier 2");
     assert_eq!(answer, "TIER2_VALID");
     assert_eq!(tier, 2);
+}
+
+/// Le solveur doit envoyer `Authorization: Bearer <token>` au tier dont un
+/// jeton est configuré, et rester nu sur un tier sans jeton. C'est ce qui
+/// rend ia-general exploitable (401 sans jeton, 200 avec).
+#[tokio::test]
+async fn ollama_client_sends_bearer_token_on_tier1() {
+    let _g = solver_lock().await;
+    let mock = MockOllama::new("ok", "ok", "ANSWER_WITH_TOKEN");
+    let (url1, url2, mock_state, _server) = start_mock_ollama(mock.clone()).await;
+    let solver_cfg = SolverConfig {
+        tier1: url1,
+        tier2: url2,
+        model: "qwen2.5-vl".into(),
+        tier1_token: "TOKEN_TIER1".into(),
+        tier2_token: String::new(),
+    };
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
+    let (answer, tier) = client.solve("IMAGE").await.expect("solve OK");
+    assert_eq!(answer, "ANSWER_WITH_TOKEN");
+    assert_eq!(tier, 1);
+    assert_eq!(
+        mock_state.tier1_auth(),
+        Some("Bearer TOKEN_TIER1".to_string()),
+        "le tier 1 doit recevoir le Bearer configuré"
+    );
+    assert_eq!(mock_state.tier2_auth(), None, "tier 2 sans jeton : requête nue");
+}
+
+/// Variante : au repli sur le tier 2, c'est le jeton du tier 2 qui part.
+#[tokio::test]
+async fn ollama_client_sends_bearer_token_on_fallback() {
+    let _g = solver_lock().await;
+    let mock = MockOllama::new("error", "ok", "TIER2_TOKEN_ANSWER");
+    let (url1, url2, mock_state, _server) = start_mock_ollama(mock.clone()).await;
+    let solver_cfg = SolverConfig {
+        tier1: url1,
+        tier2: url2,
+        model: "qwen2.5-vl".into(),
+        tier1_token: String::new(),
+        tier2_token: "TOKEN_TIER2".into(),
+    };
+    let client = OllamaClient::new_with_timeout(&solver_cfg, Duration::from_secs(5));
+    let (answer, tier) = client.solve("IMAGE").await.expect("repli tier 2");
+    assert_eq!(answer, "TIER2_TOKEN_ANSWER");
+    assert_eq!(tier, 2);
+    assert_eq!(mock_state.tier1_auth(), None, "tier 1 sans jeton : requête nue");
+    assert_eq!(mock_state.tier2_auth(), Some("Bearer TOKEN_TIER2".to_string()));
+}
+
+/// Test « live » (réseau local requis, ignoré par défaut) : vérifie que le
+/// jeton déclaré dans `~/.dsh-eyes/iaq-token` est accepté par ia-general.
+/// Reproduit la configuration de production — tier 1 = serveur-ia (sans
+/// jeton), tier 2 = ia-general (Bearer). Un jeton manquant ou refusé fait
+/// échouer ce test (401 → pas de repli possible).
+///
+/// Lancement : `cargo test --test solver -- --ignored live_iaq_token_accepted`
+#[tokio::test]
+#[ignore]
+async fn live_iaq_token_accepted() {
+    let home = std::env::var("DSH_EYES_HOME").unwrap_or_else(|_| {
+        format!("{}/.dsh-eyes", std::env::var("HOME").unwrap_or_default())
+    });
+    let token = std::fs::read_to_string(format!("{home}/iaq-token"))
+        .expect("~/.dsh-eyes/iaq-token absent")
+        .trim()
+        .to_string();
+    assert!(!token.is_empty(), "jeton ia-general vide");
+    // Tier 1 volontairement injoignable (port fermé) : force le repli sur
+    // ia-general, seul moyen de prouver que le Bearer est accepté.
+    let cfg = SolverConfig {
+        tier1: "http://127.0.0.1:9".into(),
+        tier2: "http://10.0.0.223:8001".into(),
+        model: "qwen2.5vl:7b".into(),
+        tier1_token: String::new(),
+        tier2_token: token,
+    };
+    let client = OllamaClient::new(&cfg);
+    // PNG 1x1 valide : suffit à prouver que l'endpoint authentifié répond.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let (answer, tier) = client
+        .solve(png)
+        .await
+        .expect("ia-general doit accepter le jeton Bearer");
+    assert_eq!(tier, 2, "le repli doit venir de ia-general (tier 2)");
+    assert!(!answer.is_empty(), "réponse vide");
 }

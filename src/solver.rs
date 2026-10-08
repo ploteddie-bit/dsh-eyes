@@ -184,6 +184,10 @@ pub struct OllamaClient {
     tier1_url: String,
     tier2_url: String,
     model: String,
+    /// Token Bearer du tier 1 (vide = requête sans en-tête d'auth).
+    tier1_token: String,
+    /// Token Bearer du tier 2 (vide = requête sans en-tête d'auth).
+    tier2_token: String,
     http: reqwest::Client,
 }
 
@@ -218,6 +222,8 @@ impl OllamaClient {
             tier1_url: solver.tier1.clone(),
             tier2_url: solver.tier2.clone(),
             model: solver.model.clone(),
+            tier1_token: solver.tier1_token.clone(),
+            tier2_token: solver.tier2_token.clone(),
             http,
         }
     }
@@ -235,6 +241,8 @@ impl OllamaClient {
             tier1_url: solver.tier1.clone(),
             tier2_url: solver.tier2.clone(),
             model: solver.model.clone(),
+            tier1_token: solver.tier1_token.clone(),
+            tier2_token: solver.tier2_token.clone(),
             http,
         }
     }
@@ -250,11 +258,17 @@ impl OllamaClient {
             give the characters exactly; if it is an image grid \
             (select tiles), reply as JSON array of tile indexes \
             starting at 1, row-major. No other words.";
-        let tier1_err = match self.try_tier(&self.tier1_url, image_b64, prompt).await {
+        let tier1_err = match self
+            .try_tier(&self.tier1_url, &self.tier1_token, image_b64, prompt)
+            .await
+        {
             Ok(answer) => return Ok((answer, 1)),
             Err(e) => e,
         };
-        let tier2_err = match self.try_tier(&self.tier2_url, image_b64, prompt).await {
+        let tier2_err = match self
+            .try_tier(&self.tier2_url, &self.tier2_token, image_b64, prompt)
+            .await
+        {
             Ok(answer) => return Ok((answer, 2)),
             Err(e) => e,
         };
@@ -263,7 +277,13 @@ impl OllamaClient {
 
     /// Tente un tier unique. Retourne `Ok(answer)` ou `Err(msg)`.
     /// Privé : seul [`OllamaClient::solve`] l'appelle.
-    async fn try_tier(&self, base_url: &str, image_b64: &str, prompt: &str) -> Result<String, String> {
+    async fn try_tier(
+        &self,
+        base_url: &str,
+        token: &str,
+        image_b64: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
         // Endpoint Ollama /api/generate. La forme exacte du JSON est
         // imposée par l'API Ollama : `model`, `prompt`, `images: [b64]`,
         // `stream: false`. On retire tout préfixe MIME potentiel du
@@ -275,7 +295,14 @@ impl OllamaClient {
             "images": [strip_data_url_prefix(image_b64)],
             "stream": false,
         });
-        let resp = match self.http.post(&url).json(&body).send().await {
+        // Authentification optionnelle : un routeur compatible Ollama peut
+        // exiger un jeton (ia-general répond 401 sans lui) ; un Ollama nu
+        // ignore l'en-tête. Token vide → comportement historique inchangé.
+        let mut request = self.http.post(&url).json(&body);
+        if !token.is_empty() {
+            request = request.bearer_auth(token);
+        }
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 return Err(format!("HTTP error: {e}"));

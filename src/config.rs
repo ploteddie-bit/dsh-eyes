@@ -47,6 +47,11 @@ pub struct Config {
     pub ollama_tier2_url: String,
     /// Modèle vision utilisé par le solveur de captcha (défaut `qwen2.5-vl`).
     pub vision_model: String,
+    /// Token Bearer du tier 1 (résolu depuis `ollama_tier1_token_file`) ;
+    /// chaîne vide = requête sans en-tête d'authentification.
+    pub ollama_tier1_token: String,
+    /// Token Bearer du tier 2 (résolu depuis `ollama_tier2_token_file`).
+    pub ollama_tier2_token: String,
 }
 
 /// Sous-ensemble de [`Config`] utile au solveur de captcha. Extrait
@@ -64,6 +69,10 @@ pub struct SolverConfig {
     pub tier1: String,
     pub tier2: String,
     pub model: String,
+    /// Token Bearer du tier 1 (vide = requête sans en-tête d'auth).
+    pub tier1_token: String,
+    /// Token Bearer du tier 2 (vide = requête sans en-tête d'auth).
+    pub tier2_token: String,
 }
 
 /// Représentation sérialisable dans `config.toml`. Pas de `api_token`
@@ -81,6 +90,15 @@ pub struct ConfigFile {
     /// Modèle vision pour le solveur de captcha.
     #[serde(default = "default_vision_model")]
     pub vision_model: String,
+    /// Chemin du fichier contenant le token Bearer attendu par le tier 1
+    /// (absolu, ou résolu sous `$DSH_EYES_HOME`). Vide → aucune
+    /// authentification (comportement historique). Le secret ne vit jamais
+    /// dans `config.toml`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ollama_tier1_token_file: String,
+    /// Idem pour le tier 2.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ollama_tier2_token_file: String,
     /// Toléré pour rétro-compat avec un ancien `config.toml`. Ignoré.
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
@@ -127,6 +145,8 @@ impl Config {
             ollama_tier1_url: cfg_file.ollama_tier1_url,
             ollama_tier2_url: cfg_file.ollama_tier2_url,
             vision_model: cfg_file.vision_model,
+            ollama_tier1_token: load_optional_token(&home, &cfg_file.ollama_tier1_token_file),
+            ollama_tier2_token: load_optional_token(&home, &cfg_file.ollama_tier2_token_file),
         })
     }
 
@@ -149,6 +169,8 @@ impl Config {
             tier1: self.ollama_tier1_url.clone(),
             tier2: self.ollama_tier2_url.clone(),
             model: self.vision_model.clone(),
+            tier1_token: self.ollama_tier1_token.clone(),
+            tier2_token: self.ollama_tier2_token.clone(),
         }
     }
 
@@ -167,6 +189,8 @@ impl Config {
             ollama_tier1_url: "http://localhost:11434".into(),
             ollama_tier2_url: "http://localhost:11434".into(),
             vision_model: default_vision_model(),
+            ollama_tier1_token: String::new(),
+            ollama_tier2_token: String::new(),
         }
     }
 
@@ -186,6 +210,8 @@ impl Config {
             ollama_tier1_url: tier1_url.into(),
             ollama_tier2_url: tier2_url.into(),
             vision_model: default_vision_model(),
+            ollama_tier1_token: String::new(),
+            ollama_tier2_token: String::new(),
         }
     }
 
@@ -202,6 +228,8 @@ impl Config {
             ollama_tier1_url: tier1_url.into(),
             ollama_tier2_url: tier2_url.into(),
             vision_model: default_vision_model(),
+            ollama_tier1_token: String::new(),
+            ollama_tier2_token: String::new(),
         }
     }
 
@@ -226,6 +254,8 @@ impl Config {
             ollama_tier1_url: tier1_url.into(),
             ollama_tier2_url: tier2_url.into(),
             vision_model: default_vision_model(),
+            ollama_tier1_token: String::new(),
+            ollama_tier2_token: String::new(),
         }
     }
 }
@@ -258,6 +288,35 @@ fn load_or_create_config_file(home: &Path) -> std::io::Result<ConfigFile> {
             tracing::warn!(error = %e, path = %path.display(),
                 "lecture config.toml impossible ; défauts appliqués");
             Ok(ConfigFile::default())
+        }
+    }
+}
+
+/// Résout le token Bearer d'un tier depuis le chemin déclaré.
+///
+/// - `ref_path` vide → chaîne vide (aucune authentification : c'est le
+///   comportement historique, inchangé pour les déploiements sans jeton).
+/// - chemin absolu utilisé tel quel ; chemin relatif résolu sous
+///   `$DSH_EYES_HOME`.
+/// - fichier absent ou illisible → `tracing::warn!` et chaîne vide : le
+///   démon démarre toujours, la cascade tier 1 → tier 2 → humain reste
+///   intacte.
+fn load_optional_token(home: &Path, ref_path: &str) -> String {
+    let declared = ref_path.trim();
+    if declared.is_empty() {
+        return String::new();
+    }
+    let path = if Path::new(declared).is_absolute() {
+        PathBuf::from(declared)
+    } else {
+        home.join(declared)
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => raw.trim().to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(),
+                "token de tier illisible ; ce tier sera appelé sans authentification");
+            String::new()
         }
     }
 }
