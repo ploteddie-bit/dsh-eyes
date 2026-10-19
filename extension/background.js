@@ -578,14 +578,29 @@ const nativeCursor = new Map(); // tab_id → {x, y}
 
 const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Attache le debugger le temps de `fn(dbg)`, détache TOUJOURS ensuite. */
+/** Attache le debugger le temps de `fn(dbg)`, détache TOUJOURS ensuite.
+ *  v0.5.3 : plomberie blindée — chaque commande CDP est bornée (8 s), le
+ *  geste entier est borné (15 s), le détachement est borné (1,5 s) et non
+ *  bloquant. Constat 20/10 : le clic était DÉLIVRÉ (isTrusted=true capté)
+ *  mais la réponse au démon se perdait (timeout 25 s côté démon) — désormais
+ *  pire cas ~16,5 s < 25 s : l'accusé de réception revient toujours. */
 async function withDebugger(tabId, fn) {
   await chrome.debugger.attach({ tabId }, "1.3");
-  const dbg = (method, params) => chrome.debugger.sendCommand({ tabId }, method, params);
+  const dbg = (method, params) => Promise.race([
+    chrome.debugger.sendCommand({ tabId }, method, params),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("CDP " + method + " sans réponse (8 s)")), 8000)),
+  ]);
   try {
-    return await fn(dbg);
+    const garde = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("geste natif incomplet (15 s)")), 15000));
+    return await Promise.race([fn(dbg), garde]);
   } finally {
-    try { await chrome.debugger.detach({ tabId }); } catch (_) { /* déjà parti */ }
+    try {
+      await Promise.race([
+        chrome.debugger.detach({ tabId }),
+        new Promise((r) => setTimeout(r, 1500)),
+      ]);
+    } catch (_) { /* déjà détaché */ }
   }
 }
 
