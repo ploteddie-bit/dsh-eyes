@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DSH Eyes",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Vigil de navigation + mains du navigateur pour le harnais DSH. 0.5.1 : eval via CDP (insensible CSP) + focus fenêtre avant clic OS (click_native_text/rect), screen_pos (coords écran pour os-clic.sh = VRAI pointeur Windows), wait_for borné.",
   "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms", "tabGroups", "debugger"],
   "host_permissions": ["<all_urls>"],

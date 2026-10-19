@@ -812,8 +812,16 @@ async function cmdScreenPos({ tab_id, selector }) {
   // v0.5.1 : focusser la FENÊTRE aussi — le clic OS frappe ce qui est au
   // premier plan de l'OS ; sans focus, il cliquait dans la fenêtre du
   // dessus (constat 20/10 : clic parti dans VS Code, pas dans Chrome).
+  // v0.5.2 : une fenêtre MINIMISÉE rend une géométrie absurde (barresY
+  // négatif constaté) et `focused` ne la restaure pas — on ne touche au
+  // state QUE si elle est minimisée (restauration maximisée).
   if (tab.windowId) {
-    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* fenêtre fermée */ }
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      const maj = { focused: true };
+      if (win.state === "minimized") maj.state = "maximized";
+      await chrome.windows.update(tab.windowId, maj);
+    } catch (_) { /* fenêtre fermée */ }
   }
   await sleepNat(250);
   const [res] = await chrome.scripting.executeScript({
