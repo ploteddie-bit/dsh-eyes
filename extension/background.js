@@ -369,6 +369,14 @@ async function dispatchCommand(cmd, params) {
       return cmdEval(params);
     case "click_native":
       return cmdClickNative(params);
+    case "click_native_text":
+      return cmdClickNativeText(params);
+    case "click_native_rect":
+      return cmdClickNativeRect(params);
+    case "screen_pos":
+      return cmdScreenPos(params);
+    case "wait_for":
+      return cmdWaitFor(params);
     case "type_native":
       return cmdTypeNative(params);
     case "scroll_native":
@@ -741,6 +749,126 @@ async function cmdScrollNative({ tab_id, dy }) {
     }
     return { scrolled: total, crans, native: true };
   });
+}
+
+/** Trouve un élément PAR TEXTE (lecture seule) et renvoie son rect viewport.
+ *  Pont eval→natif : eval SAIT trouver (SPA, Angular), le natif SAIT
+ *  cliquer. Aucun geste en JS ici. */
+async function chercherRectTexte(id, texte, exact) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: (txt, ex) => {
+      const normaliser = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const cibles = [...document.querySelectorAll("a,button,[role=button],[role=tab],[role=link],input[type=submit],input[type=button]")];
+      const el = ex
+        ? cibles.find((e) => normaliser(e.textContent) === txt)
+        : cibles.find((e) => normaliser(e.textContent).startsWith(txt));
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return { introuvable: "hors viewport" };
+      return { x: r.x, y: r.y, w: r.width, h: r.height, texte: normaliser(el.textContent).slice(0, 40) };
+    },
+    args: [texte, !!exact],
+  });
+  return res ? res.result : null;
+}
+
+/** Clic natif sur un élément repéré PAR TEXTE (GA4/Angular : pas de
+ *  sélecteur stable, mais un libellé). Préfixe par défaut, exact:true sinon. */
+async function cmdClickNativeText({ tab_id, text, exact }) {
+  if (typeof text !== "string" || !text) throw new Error("click_native_text: 'text' requis");
+  const id = await resolveTabId(tab_id);
+  const rect = await chercherRectTexte(id, text, exact);
+  if (!rect) throw new Error("click_native_text: aucun élément portant le texte: " + text);
+  if (rect.introuvable) throw new Error("click_native_text: élément « " + text + " » hors viewport (scroll_native d'abord)");
+  return clicNatifSurRect(id, rect, JSON.stringify(text));
+}
+
+/** Clic natif à des coordonnées viewport BRUTES — brique universelle :
+ *  eval cherche par n'importe quelle logique, ce clic exécute. */
+async function cmdClickNativeRect({ tab_id, x, y }) {
+  const px = Math.round(Number(x));
+  const py = Math.round(Number(y));
+  if (!Number.isFinite(px) || !Number.isFinite(py)) throw new Error("click_native_rect: 'x'/'y' requis");
+  const id = await resolveTabId(tab_id);
+  return clicNatifSurRect(id, { x: px, y: py, w: 0, h: 0 }, px + "," + py);
+}
+
+/** Cœur partagé des clics natifs : gaussienne dans le rect (si surface),
+ *  trajectoire, hésitation, press/release — isTrusted=true. */
+async function clicNatifSurRect(id, rect, libelle) {
+  const cible = {
+    x: Math.round(rect.x + (rect.w > 8 ? rect.w * fractionGaussienne() : 0)),
+    y: Math.round(rect.y + (rect.h > 8 ? rect.h * fractionGaussienne() : 0)),
+  };
+  return withDebugger(id, async (dbg) => {
+    await deplacerCurseur(dbg, id, cible);
+    await sleepNat(40 + Math.random() * 60);
+    await dbg("Input.dispatchMouseEvent", { type: "mousePressed", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
+    await sleepNat(45 + Math.random() * 50);
+    await dbg("Input.dispatchMouseEvent", { type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
+    return { clicked: libelle, at: cible, native: true };
+  });
+}
+
+/** Géométrie ÉCRAN d'un sélecteur : active l'onglet (le clic OS frappe ce
+ *  qui est à l'écran), renvoie la conversion viewport→écran — le script
+ *  os-clic.sh déplace ensuite le VRAI pointeur (SetCursorPos+mouse_event). */
+async function cmdScreenPos({ tab_id, selector }) {
+  if (typeof selector !== "string" || !selector) throw new Error("screen_pos: 'selector' requis");
+  const id = await resolveTabId(tab_id);
+  await chrome.tabs.update(id, { active: true });
+  await sleepNat(150);
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {
+        cssX: Math.round(r.x + r.width / 2), cssY: Math.round(r.y + r.height / 2),
+        rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+        screenX: window.screenX, screenY: window.screenY,
+        barresY: window.outerHeight - window.innerHeight,
+        bordsX: Math.max(0, Math.round((window.outerWidth - window.innerWidth) / 2)),
+        dpr: window.devicePixelRatio || 1,
+        visible: r.width > 0 && r.height > 0,
+      };
+    },
+    args: [selector],
+  });
+  const geo = res ? res.result : null;
+  if (!geo) throw new Error("screen_pos: sélecteur introuvable: " + selector);
+  if (!geo.visible) throw new Error("screen_pos: élément hors viewport");
+  // Formule nominale (px écran) ; offset de calibrage éventuel côté script OS.
+  geo.ecranX = Math.round(geo.screenX + geo.bordsX + geo.cssX * geo.dpr);
+  geo.ecranY = Math.round(geo.screenY + geo.barresY + geo.cssY * geo.dpr);
+  return geo;
+}
+
+/** Attente polluante bornée d'un sélecteur OU d'un texte — remplace les
+ *  sleep arbitraires (SPA lentes : GA4 met 3-8 s à rendre). */
+async function cmdWaitFor({ tab_id, selector, text, timeout_ms }) {
+  const id = await resolveTabId(tab_id);
+  const aSelector = typeof selector === "string" && selector.length > 0;
+  const aTexte = typeof text === "string" && text.length > 0;
+  if (!aSelector && !aTexte) throw new Error("wait_for: 'selector' ou 'text' requis");
+  const borne = Math.min(Math.max(Number(timeout_ms) || 10000, 500), 60000);
+  const debut = Date.now();
+  const limite = debut + borne;
+  while (Date.now() < limite) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: (sel, txt) => {
+        if (sel) return !!document.querySelector(sel);
+        return (document.body ? document.body.innerText : "").includes(txt);
+      },
+      args: [aSelector ? selector : null, aTexte ? text : null],
+    });
+    if (res && res.result) return { trouve: true, attente_ms: Date.now() - debut };
+    await sleepNat(250);
+  }
+  return { trouve: false, timeout_ms: borne };
 }
 
 /**

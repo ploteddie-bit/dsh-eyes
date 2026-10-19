@@ -62,6 +62,10 @@ Commandes supportées (cf. `extension/background.js`) :
 - `click_native {tab_id?, selector}` — **clic NATIF** via `chrome.debugger` + `Input.dispatchMouseEvent` (événements `isTrusted=true`) : trajectoire 3-8 points depuis le dernier curseur connu, hésitation pré-clic, press/release espacés. Le JS ne fait que LIRE la géométrie (doctrine new-pmu règle 9 : un clic JS est identifiable). Bandeau « débogage » visible pendant le geste — assumé.
 - `type_native {tab_id?, selector?, text, submit?}` — **frappe native** caractère par caractère (`Input.dispatchKeyEvent`), dwell 40-160 ms/touche. `selector` optionnel : focus + sélection du contenu existant (préparation d'état, pas un geste). `submit: true` ajoute Entrée.
 - `scroll_native {tab_id?, dy}` — **molette native** par crans de 90-135 px (30-70 ms d'écart). Jamais de scroll JS (signature : 0 événement wheel + saut instantané).
+- `click_native_text {tab_id?, text, exact?}` — clic natif sur un élément repéré **par libellé** (préfixe par défaut, égalité stricte si `exact:true`). LE pont vers les SPA sans sélecteur stable (GA4/Angular) : le JS ne fait que chercher/lire, le natif clique.
+- `click_native_rect {tab_id?, x, y}` — clic natif à des coordonnées viewport brutes : brique universelle (eval cherche par n'importe quelle logique, ce clic exécute).
+- `screen_pos {tab_id?, selector}` — active l'onglet et renvoie la géométrie **écran** de l'élément (`ecranX/ecranY`) — à passer à `bin/os-clic.sh` qui déplace le **VRAI pointeur Windows** (SetCursorPos + mouse_event via interop WSL→PowerShell). Contrôle exclusif du pointeur pendant ~300 ms ; offsets de calibrage `OS_OFFSET_X/Y` si zoom/DPI atypique.
+- `wait_for {tab_id?, selector|text, timeout_ms?}` — attente polluante bornée (250 ms, max 60 s) d'un sélecteur OU d'un texte : remplace les sleep arbitraires des scripts sur SPA lentes.
 
 ### Doctrine d'emploi des gestes natifs (v0.4)
 

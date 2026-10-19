@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DSH Eyes",
-  "version": "0.4.0",
-  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH (modèle webbridge, REWORK 2026-10-05). 0.4.0 : gestes NATIFS click_native/type_native/scroll_native (chrome.debugger + Input.dispatch*, isTrusted=true, doctrine new-pmu règles 9-10).",
+  "version": "0.5.0",
+  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH. 0.5.0 : pont eval→natif (click_native_text/rect), screen_pos (coords écran pour os-clic.sh = VRAI pointeur Windows), wait_for borné.",
   "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms", "tabGroups", "debugger"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js", "type": "module" }
