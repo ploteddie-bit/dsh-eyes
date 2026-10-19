@@ -16,11 +16,13 @@ PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 
 "$PS" -NoProfile -Command '& {
   Add-Type -AssemblyName System.Windows.Forms
-  Add-Type -MemberDefinition "[DllImport(`"user32.dll`")] public static extern bool SetCursorPos(int x,int y); [DllImport(`"user32.dll`")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,UIntPtr e); [DllImport(`"user32.dll`")] public static extern bool SetForegroundWindow(IntPtr h);" -Name U32 -Namespace W
-  # v0.5.1 : amener Chrome au premier plan (sinon le clic frappe la fenetre
-  # du dessus — constat 20/10 : clic parti dans VS Code).
+  Add-Type -MemberDefinition "[DllImport(`"user32.dll`")] public static extern bool SetCursorPos(int x,int y); [DllImport(`"user32.dll`")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,UIntPtr e); [DllImport(`"user32.dll`")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport(`"user32.dll`")] public static extern bool ShowWindow(IntPtr h, int c);" -Name U32 -Namespace W
+  # v0.5.2 : amener Chrome au premier plan ET le restaurer si minimisé.
+  # Constat : Chrome remonte parfois state≠minimized alors que la fenetre
+  # est minimisee (geometrie absurde barresY<0 cote extension) - on restaure
+  # cote WINDOWS, ShowWindow(9)=SW_RESTORE, inoffensif si deja visible.
   $c = Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-  if ($c) { [W.U32]::SetForegroundWindow($c.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 250 }
+  if ($c) { [W.U32]::ShowWindow($c.MainWindowHandle, 9) | Out-Null; [W.U32]::SetForegroundWindow($c.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 350 }
   $x=[int]$args[0]; $y=[int]$args[1]
   $p=[System.Windows.Forms.Cursor]::Position
   $n=6
