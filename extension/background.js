@@ -538,36 +538,26 @@ async function cmdEval({ tab_id, code, arg }) {
     throw new Error("eval: 'code' (string) requis");
   }
   const id = await resolveTabId(tab_id);
-  // Auto-contenu : sérialisé par toString, aucune closure externe.
-  const injection = async (src, a) => {
-    const sanitize = (v) => {
-      if (v === undefined) return null;
-      if (v === null || typeof v !== "object") return v;
-      try {
-        return JSON.parse(JSON.stringify(v));
-      } catch {
-        return String(v);
-      }
-    };
-    let out;
-    try {
-      const f = eval(src); // eslint-disable-line no-eval — voulu
-      out = typeof f === "function" ? await f(a) : await f;
-    } catch (e) {
-      return { __eval_error: String(e && e.message ? e.message : e) };
+  // v0.5.1 : évaluation via CDP Runtime.evaluate — INSENSIBLE à la CSP de
+  // la page. Constat 20/10 : scripting.executeScript + eval() interne était
+  // bloqué par les sites à CSP stricte (le nôtre : script-src sans
+  // unsafe-eval — GA4 l'acceptait, annonces-m2m.com non). Runtime.evaluate
+  // tourne dans le moteur, hors CSP, monde principal de la page.
+  const expression = `(async () => { const f = ${code}; ` +
+    `return typeof f === "function" ? await f(${JSON.stringify(arg === undefined ? null : arg)}) : await f; })()`;
+  return withDebugger(id, async (dbg) => {
+    const rep = await dbg("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (rep.exceptionDetails) {
+      const d = rep.exceptionDetails;
+      return { __eval_error: String((d.exception && (d.exception.description || d.exception.value)) || d.text || "erreur") };
     }
-    return sanitize(out);
-  };
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: id },
-    func: injection,
-    args: [code, arg === undefined ? null : arg],
-    world: "MAIN",
+    const v = rep.result && rep.result.value;
+    return { value: v === undefined ? null : v };
   });
-  if (!Array.isArray(results) || results.length === 0) {
-    throw new Error("eval: executeScript n'a rien renvoyé");
-  }
-  return { value: results[0].result ?? null };
 }
 
 // ── v0.4 : gestes NATIFS (chrome.debugger + Input.dispatch*) ────────────
@@ -817,8 +807,15 @@ async function clicNatifSurRect(id, rect, libelle) {
 async function cmdScreenPos({ tab_id, selector }) {
   if (typeof selector !== "string" || !selector) throw new Error("screen_pos: 'selector' requis");
   const id = await resolveTabId(tab_id);
+  const tab = await chrome.tabs.get(id);
   await chrome.tabs.update(id, { active: true });
-  await sleepNat(150);
+  // v0.5.1 : focusser la FENÊTRE aussi — le clic OS frappe ce qui est au
+  // premier plan de l'OS ; sans focus, il cliquait dans la fenêtre du
+  // dessus (constat 20/10 : clic parti dans VS Code, pas dans Chrome).
+  if (tab.windowId) {
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (_) { /* fenêtre fermée */ }
+  }
+  await sleepNat(250);
   const [res] = await chrome.scripting.executeScript({
     target: { tabId: id },
     func: (sel) => {

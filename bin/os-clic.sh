@@ -16,7 +16,11 @@ PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 
 "$PS" -NoProfile -Command '& {
   Add-Type -AssemblyName System.Windows.Forms
-  Add-Type -MemberDefinition "[DllImport(`"user32.dll`")] public static extern bool SetCursorPos(int x,int y); [DllImport(`"user32.dll`")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,UIntPtr e);" -Name U32 -Namespace W
+  Add-Type -MemberDefinition "[DllImport(`"user32.dll`")] public static extern bool SetCursorPos(int x,int y); [DllImport(`"user32.dll`")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,UIntPtr e); [DllImport(`"user32.dll`")] public static extern bool SetForegroundWindow(IntPtr h);" -Name U32 -Namespace W
+  # v0.5.1 : amener Chrome au premier plan (sinon le clic frappe la fenetre
+  # du dessus — constat 20/10 : clic parti dans VS Code).
+  $c = Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  if ($c) { [W.U32]::SetForegroundWindow($c.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 250 }
   $x=[int]$args[0]; $y=[int]$args[1]
   $p=[System.Windows.Forms.Cursor]::Position
   $n=6
