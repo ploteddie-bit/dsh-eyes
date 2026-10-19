@@ -59,6 +59,19 @@ Commandes supportées (cf. `extension/background.js`) :
 - `screenshot {tab_id?, format?}` — capture le viewport (`captureVisibleTab`), dataURL PNG/JPEG.
 - `captcha_detect {tab_id?}` — détection captcha + capture.
 - `eval {tab_id?, code, arg?}` — **exécute du JS arbitraire dans la page (monde MAIN)**. `code` = expression (`"document.title"`) ou fonction sérialisée (`"(a) => a.x + 1"`) recevant `arg` (JSON). Promesses attendues, résultat assaini (structure-cloneable). Dernier recours quand les sélecteurs CSS n'atteignent pas les SPA (Angular, GA4, widgets Fluent) : clic par texte, lecture de composants, injection d'overlay visuel. Ex. clic par texte : `"() => { const el=[...document.querySelectorAll('a,button,[role=link]')].find(e=>e.textContent.trim().startsWith('Événements')); if(!el) return 'introuvable'; el.click(); return el.textContent.trim(); }"`
+- `click_native {tab_id?, selector}` — **clic NATIF** via `chrome.debugger` + `Input.dispatchMouseEvent` (événements `isTrusted=true`) : trajectoire 3-8 points depuis le dernier curseur connu, hésitation pré-clic, press/release espacés. Le JS ne fait que LIRE la géométrie (doctrine new-pmu règle 9 : un clic JS est identifiable). Bandeau « débogage » visible pendant le geste — assumé.
+- `type_native {tab_id?, selector?, text, submit?}` — **frappe native** caractère par caractère (`Input.dispatchKeyEvent`), dwell 40-160 ms/touche. `selector` optionnel : focus + sélection du contenu existant (préparation d'état, pas un geste). `submit: true` ajoute Entrée.
+- `scroll_native {tab_id?, dy}` — **molette native** par crans de 90-135 px (30-70 ms d'écart). Jamais de scroll JS (signature : 0 événement wheel + saut instantané).
+
+### Doctrine d'emploi des gestes natifs (v0.4)
+
+Issue de new-pmu (règles 9-10 du 12/10/2026, mesurées en A/B live) :
+`el.click()` et `dispatchEvent` produisent des événements `isTrusted=false`
+— identifiables par les plateformes qui surveillent (constat eBay 20/10 :
+anti-bot déclenché par des clics JS). Les commandes `_native` émettent de
+vrais événements d'entrée. **Usage réservé à NOS consoles et NOS comptes**
+(GA4, GSC, Bing, Chrome d'Eddie) — jamais pour contourner des CGU ou sur
+des comptes en contentieux (eBay suspendu = à la main).
 
 ## Build statique (musl)
 

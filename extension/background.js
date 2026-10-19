@@ -367,6 +367,12 @@ async function dispatchCommand(cmd, params) {
       return cmdCaptchaDetect(params);
     case "eval":
       return cmdEval(params);
+    case "click_native":
+      return cmdClickNative(params);
+    case "type_native":
+      return cmdTypeNative(params);
+    case "scroll_native":
+      return cmdScrollNative(params);
     default:
       throw new Error(`commande inconnue: ${cmd}`);
   }
@@ -554,6 +560,187 @@ async function cmdEval({ tab_id, code, arg }) {
     throw new Error("eval: executeScript n'a rien renvoyé");
   }
   return { value: results[0].result ?? null };
+}
+
+// ── v0.4 : gestes NATIFS (chrome.debugger + Input.dispatch*) ────────────
+// Doctrine importée de new-pmu (règles 9-10, directives du 12/10/2026) :
+// le JS de page ne déclenche JAMAIS un geste — el.click() produit des
+// événements isTrusted=false, signature d'automatisation mesurée en A/B
+// (« clic JS = identifiable, souris native = propre »). Le JS ne sert
+// qu'à LIRE (géométrie de l'élément) ; tout geste passe par le protocole
+// d'entrée natif : Input.dispatchMouseEvent / dispatchKeyEvent via
+// chrome.debugger → événements isTrusted=true, indiscernables d'une
+// vraie souris/clavier.
+// NB : chaque commande attache puis détache le debugger — le bandeau
+// « a commencé le débogage » clignote en haut du Chrome : c'est le
+// signal honnête qu'un geste natif est en cours.
+
+/** Dernier point curseur connu par onglet (les trajectoires partent de là). */
+const nativeCursor = new Map(); // tab_id → {x, y}
+
+const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Attache le debugger le temps de `fn(dbg)`, détache TOUJOURS ensuite. */
+async function withDebugger(tabId, fn) {
+  await chrome.debugger.attach({ tabId }, "1.3");
+  const dbg = (method, params) => chrome.debugger.sendCommand({ tabId }, method, params);
+  try {
+    return await fn(dbg);
+  } finally {
+    try { await chrome.debugger.detach({ tabId }); } catch (_) { /* déjà parti */ }
+  }
+}
+
+/** Fraction gaussienne (Box-Muller) bornée [lo, hi] — jamais le centre exact. */
+function fractionGaussienne(lo = 0.2, hi = 0.8) {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  const g = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  return Math.min(hi, Math.max(lo, 0.5 + g * 0.15));
+}
+
+/** Trajectoire courte vers la cible : 3-8 mouseMoved interpolés, cadence
+ *  irrégulière, part du dernier point connu — jamais de téléportation. */
+async function deplacerCurseur(dbg, tabId, cible) {
+  const dep = nativeCursor.get(tabId) || { x: 8, y: Math.round(120 + Math.random() * 240) };
+  const etapes = 3 + Math.floor(Math.random() * 5);
+  for (let i = 1; i <= etapes; i++) {
+    const t = i / etapes;
+    const x = Math.round(dep.x + (cible.x - dep.x) * t + (Math.random() - 0.5) * 2);
+    const y = Math.round(dep.y + (cible.y - dep.y) * t + (Math.random() - 0.5) * 2);
+    await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await sleepNat(8 + Math.random() * 17);
+  }
+  nativeCursor.set(tabId, cible);
+}
+
+/** Lecture seule en JS : géométrie viewport d'un sélecteur. */
+async function lireRect(id, selector) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, w: r.width, h: r.height, visible: r.width > 0 && r.height > 0 };
+    },
+    args: [selector],
+  });
+  return res ? res.result : null;
+}
+
+/** Clic natif : trajectoire + hésitation + press/release (isTrusted=true). */
+async function cmdClickNative({ tab_id, selector }) {
+  if (typeof selector !== "string" || !selector) {
+    throw new Error("click_native: 'selector' (string) requis");
+  }
+  const id = await resolveTabId(tab_id);
+  const rect = await lireRect(id, selector);
+  if (!rect) throw new Error("click_native: sélecteur introuvable: " + selector);
+  if (!rect.visible) throw new Error("click_native: élément hors viewport (scroll_native d'abord)");
+  const cible = {
+    x: Math.round(rect.x + rect.w * fractionGaussienne()),
+    y: Math.round(rect.y + rect.h * fractionGaussienne()),
+  };
+  return withDebugger(id, async (dbg) => {
+    await deplacerCurseur(dbg, id, cible);
+    await sleepNat(40 + Math.random() * 60); // hésitation pré-clic
+    await dbg("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: cible.x, y: cible.y, button: "left", clickCount: 1,
+    });
+    await sleepNat(45 + Math.random() * 50);
+    await dbg("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1,
+    });
+    return { clicked: selector, at: cible, native: true };
+  });
+}
+
+/** virtual-keycode minimal : lettres/chiffres/Espace/Entrée (reste → 0). */
+function vkDe(ch) {
+  const c = ch.toUpperCase();
+  const a = c.charCodeAt(0);
+  if (c === "ENTER") return 13;
+  if (ch === " ") return 32;
+  if (a >= 65 && a <= 90) return a; // A-Z
+  if (a >= 48 && a <= 57) return a; // 0-9
+  return 0;
+}
+
+/** Frappe native caractère par caractère : keyDown(text) + keyUp, dwell
+ *  40-160 ms — jamais keyboard.press (dwell nul = signature). */
+async function cmdTypeNative({ tab_id, selector, text, submit }) {
+  if (typeof text !== "string") throw new Error("type_native: 'text' (string) requis");
+  const id = await resolveTabId(tab_id);
+  if (selector) {
+    // Préparation d'ÉTAT (focus + sélection du contenu existant) : ni clic
+    // ni frappe — pas d'événement de geste (doctrine : le JS prépare,
+    // le natif agit).
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        el.focus();
+        if (typeof el.select === "function") el.select();
+        return true;
+      },
+      args: [selector],
+    });
+    if (!res || !res.result) throw new Error("type_native: sélecteur introuvable: " + selector);
+  }
+  return withDebugger(id, async (dbg) => {
+    for (const ch of text) {
+      await dbg("Input.dispatchKeyEvent", {
+        type: "keyDown", key: ch, text: ch, unmodifiedText: ch,
+        windowsVirtualKeyCode: vkDe(ch), nativeVirtualKeyCode: vkDe(ch),
+      });
+      await sleepNat(40 + Math.random() * 120);
+      await dbg("Input.dispatchKeyEvent", {
+        type: "keyUp", key: ch, windowsVirtualKeyCode: vkDe(ch),
+      });
+      await sleepNat(15 + Math.random() * 45);
+    }
+    if (submit) {
+      await sleepNat(60 + Math.random() * 90);
+      await dbg("Input.dispatchKeyEvent", {
+        type: "keyDown", key: "Enter", code: "Enter",
+        windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+      });
+      await sleepNat(40);
+      await dbg("Input.dispatchKeyEvent", {
+        type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13,
+      });
+    }
+    return { typed: text.length, submit: !!submit, native: true };
+  });
+}
+
+/** Molette native : crans réalistes 90-135 px, 30-70 ms d'écart — jamais
+ *  de scroll JS (0 événement wheel + saut instantané = signature). */
+async function cmdScrollNative({ tab_id, dy }) {
+  const total = Math.round(Number(dy));
+  if (!Number.isFinite(total) || total === 0) {
+    throw new Error("scroll_native: 'dy' (pixels, non nul) requis");
+  }
+  const id = await resolveTabId(tab_id);
+  const sens = Math.sign(total);
+  let reste = Math.abs(total);
+  return withDebugger(id, async (dbg) => {
+    let crans = 0;
+    while (reste > 0) {
+      const cran = Math.min(reste, 90 + Math.floor(Math.random() * 46));
+      reste -= cran;
+      const p = nativeCursor.get(id) || { x: 400, y: 320 };
+      await dbg("Input.dispatchMouseEvent", {
+        type: "mouseWheel", x: p.x, y: p.y, deltaX: 0, deltaY: sens * cran,
+      });
+      crans += 1;
+      await sleepNat(30 + Math.random() * 40);
+    }
+    return { scrolled: total, crans, native: true };
+  });
 }
 
 /**
