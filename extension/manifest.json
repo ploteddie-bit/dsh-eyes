@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DSH Eyes",
-  "version": "0.2.1",
-  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH (modèle webbridge, REWORK 2026-10-05).",
+  "version": "0.3.1",
+  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH (modèle webbridge, REWORK 2026-10-05). 0.3.0 : onglet de groupe réutilisé, tab_activate, clic direct. 0.3.1 : commande eval (JS arbitraire, monde MAIN).",
   "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms", "tabGroups"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js", "type": "module" }

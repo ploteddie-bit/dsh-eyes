@@ -48,11 +48,17 @@ Codes de retour :
 
 Commandes supportées (cf. `extension/background.js`) :
 
-- `tabs_create {url}` — ouvre un onglet.
+- `tabs_create {url, group_title?}` — ouvre un onglet ; avec `group_title`, navigue l'onglet existant du groupe au lieu d'en créer un (1 onglet/groupe, fenêtre réutilisée) et renvoie `window_id`/`group_id`.
 - `goto {tab_id?, url}` — navigue un onglet (existant ou nouveau).
 - `read {tab_id, max_bytes?}` — `document.body.innerText` (200 Ko par défaut).
 - `click {tab_id, selector}` — clique sur un élément CSS.
 - `fill {tab_id, selector, value}` — remplit un input et déclenche `input`/`change`.
+- `wait {tab_id, ms}` — attend.
+- `tab_group {tab_id, title, color?}` — place l'onglet dans un groupe.
+- `tab_activate {tab_id}` — active (et focus) l'onglet.
+- `screenshot {tab_id?, format?}` — capture le viewport (`captureVisibleTab`), dataURL PNG/JPEG.
+- `captcha_detect {tab_id?}` — détection captcha + capture.
+- `eval {tab_id?, code, arg?}` — **exécute du JS arbitraire dans la page (monde MAIN)**. `code` = expression (`"document.title"`) ou fonction sérialisée (`"(a) => a.x + 1"`) recevant `arg` (JSON). Promesses attendues, résultat assaini (structure-cloneable). Dernier recours quand les sélecteurs CSS n'atteignent pas les SPA (Angular, GA4, widgets Fluent) : clic par texte, lecture de composants, injection d'overlay visuel. Ex. clic par texte : `"() => { const el=[...document.querySelectorAll('a,button,[role=link]')].find(e=>e.textContent.trim().startsWith('Événements')); if(!el) return 'introuvable'; el.click(); return el.textContent.trim(); }"`
 
 ## Build statique (musl)
 

@@ -359,10 +359,14 @@ async function dispatchCommand(cmd, params) {
       return cmdWait(params);
     case "tab_group":
       return cmdTabGroup(params);
+    case "tab_activate":
+      return cmdTabActivate(params);
     case "screenshot":
       return cmdScreenshot(params);
     case "captcha_detect":
       return cmdCaptchaDetect(params);
+    case "eval":
+      return cmdEval(params);
     default:
       throw new Error(`commande inconnue: ${cmd}`);
   }
@@ -399,21 +403,64 @@ async function findTabByUrl(url) {
 	);
 }
 
-async function cmdTabsCreate({ url }) {
+async function cmdTabsCreate({ url, group_title }) {
   if (typeof url !== "string" || !url) {
     throw new Error("tabs_create: 'url' (string) requis");
   }
+  const titre = typeof group_title === "string" && group_title ? group_title : null;
+
+  if (titre) {
+    // Réutilisation (retour Eddie) : un groupe = UN onglet de travail.
+    // Si un onglet du groupe existe déjà, on le navigue au lieu d'empiler
+    // des onglets ; la fenêtre du groupe est ainsi réutilisée elle aussi.
+    const groupes = await chrome.tabGroups.query({ title: titre });
+    for (const groupe of groupes) {
+      const onglets = await chrome.tabs.query({ groupId: groupe.id });
+      if (onglets.length > 0) {
+        const cible = onglets[0];
+        await chrome.tabs.update(cible.id, { url, active: true });
+        await waitForTabComplete(cible.id);
+        return {
+          tab_id: cible.id,
+          url,
+          reused: true,
+          window_id: cible.windowId,
+          group_id: groupe.id,
+        };
+      }
+    }
+  }
+
   // Déduplication (retour Eddie) : onglet identique déjà ouvert → focus
-  // au lieu de créer un doublon.
+  // au lieu de créer un doublon. Avec un groupe demandé, l'onglet trouvé
+  // est adopté dans le groupe (migration propre au premier passage).
   const existing = await findTabByUrl(url);
   if (existing) {
     await chrome.tabs.update(existing.id, { active: true });
     await waitForTabComplete(existing.id);
-    return { tab_id: existing.id, url: existing.url || url, reused: true };
+    const reponse_existante = {
+      tab_id: existing.id,
+      url: existing.url || url,
+      reused: true,
+      window_id: existing.windowId,
+    };
+    if (titre) {
+      const group_id = await chrome.tabs.group({ tabIds: [existing.id] });
+      await chrome.tabGroups.update(group_id, { title: titre, color: "blue" });
+      reponse_existante.group_id = group_id;
+    }
+    return reponse_existante;
   }
+
   const tab = await chrome.tabs.create({ url });
   await waitForTabComplete(tab.id);
-  return { tab_id: tab.id, url: tab.url || url, reused: false };
+  const reponse = { tab_id: tab.id, url: tab.url || url, reused: false, window_id: tab.windowId };
+  if (titre) {
+    const group_id = await chrome.tabs.group({ tabIds: [tab.id] });
+    await chrome.tabGroups.update(group_id, { title: titre, color: "blue" });
+    reponse.group_id = group_id;
+  }
+  return reponse;
 }
 
 /** Navigue un onglet (ou en crée un) vers `url`. */
@@ -461,6 +508,52 @@ async function cmdRead({ tab_id, max_bytes }) {
     throw new Error("read: résultat non-string");
   }
   return { text };
+}
+
+/**
+ * Exécute du JavaScript arbitraire dans l'onglet ciblé (monde MAIN :
+ * accès au JS de la page, utile pour les SPA type Angular/GA4 que le
+ * DOM cachait aux sélecteurs CSS). `code` est soit une expression
+ * ("document.title"), soit une fonction sérialisée "(a) => a.x + 1"
+ * recevant `arg` (JSON). Les promesses sont attendues ; le résultat
+ * est assaini (structure-cloneable) avant remontée vers le démon.
+ * Retourne { value } — null si le code n'a rien retourné.
+ */
+async function cmdEval({ tab_id, code, arg }) {
+  if (typeof code !== "string" || !code.trim()) {
+    throw new Error("eval: 'code' (string) requis");
+  }
+  const id = await resolveTabId(tab_id);
+  // Auto-contenu : sérialisé par toString, aucune closure externe.
+  const injection = async (src, a) => {
+    const sanitize = (v) => {
+      if (v === undefined) return null;
+      if (v === null || typeof v !== "object") return v;
+      try {
+        return JSON.parse(JSON.stringify(v));
+      } catch {
+        return String(v);
+      }
+    };
+    let out;
+    try {
+      const f = eval(src); // eslint-disable-line no-eval — voulu
+      out = typeof f === "function" ? await f(a) : await f;
+    } catch (e) {
+      return { __eval_error: String(e && e.message ? e.message : e) };
+    }
+    return sanitize(out);
+  };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: injection,
+    args: [code, arg === undefined ? null : arg],
+    world: "MAIN",
+  });
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error("eval: executeScript n'a rien renvoyé");
+  }
+  return { value: results[0].result ?? null };
 }
 
 /**
@@ -561,11 +654,44 @@ async function replayTypingInPage(plan, selector) {
 }
 
 /** Clique sur un élément via son sélecteur CSS — trajectoire humaine (v2.1). */
-async function cmdClick({ tab_id, selector }) {
+async function cmdClick({ tab_id, selector, direct }) {
 	if (typeof selector !== "string" || !selector) {
 		throw new Error("click: 'selector' (string) requis");
 	}
 	const real_tab_id = await resolveTabId(tab_id);
+
+	// Mode direct (usage outillé) : clic synchrone sans trajectoire ni
+	// timer. Les setTimeout du replay humain sont étranglés (≈1 s/étape
+	// quand l'onglet est throttlé), ce qui dépasse le timeout local 25 s ;
+	// le direct répond en < 300 ms quel que soit l'état de l'onglet.
+	if (direct === true) {
+		const [directRes] = await chrome.scripting.executeScript({
+			target: { tabId: real_tab_id },
+			func: (sel) => {
+				const el = document.querySelector(sel);
+				if (!el) throw new Error("sélecteur introuvable: " + sel);
+				el.scrollIntoView({ block: "center" });
+				const r = el.getBoundingClientRect();
+				const cx = Math.round(r.x + r.width / 2);
+				const cy = Math.round(r.y + r.height / 2);
+				for (const type of ["mouseover", "mousedown", "mouseup", "click"]) {
+					el.dispatchEvent(
+						new MouseEvent(type, {
+							bubbles: true,
+							cancelable: true,
+							view: window,
+							clientX: cx,
+							clientY: cy,
+							button: 0,
+						}),
+					);
+				}
+				return { clicked: sel, mode: "direct" };
+			},
+			args: [selector],
+		});
+		return directRes.result;
+	}
 
 	// 1) Centre de la cible (après scrollIntoView centre).
 	const [rectRes] = await chrome.scripting.executeScript({
@@ -720,6 +846,28 @@ async function cmdTabGroup({ tab_id, title, color }) {
   if (typeof color === "string" && color) update.color = color;
   await chrome.tabGroups.update(group_id, update);
   return { tab_id: real_tab_id, group_id, title };
+}
+
+/**
+ * Active un onglet et met sa fenetre au premier plan.
+ *
+ * Fiabilise les clics : l'animation souris de `cmdClick` utilise des
+ * setTimeout dans la page, que Chrome etrangle quand l'onglet est cache
+ * (arriere-plan) — un clic peut alors depasser le plafond de 25 s du
+ * daemon. Params: `{tab_id?}`.
+ */
+async function cmdTabActivate({ tab_id }) {
+  const real_tab_id = await resolveTabId(tab_id);
+  const tab = await chrome.tabs.get(real_tab_id);
+  await chrome.tabs.update(real_tab_id, { active: true });
+  let focused = false;
+  try {
+    await chrome.windows.update(tab.windowId, { focused: true });
+    focused = true;
+  } catch {
+    // Fenetre minimisee : Chrome peut refuser — best effort.
+  }
+  return { tab_id: real_tab_id, window_id: tab.windowId, activated: true, focused };
 }
 
 /**
