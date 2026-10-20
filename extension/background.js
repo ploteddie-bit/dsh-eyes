@@ -583,8 +583,14 @@ const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
  *  geste entier est borné (15 s), le détachement est borné (1,5 s) et non
  *  bloquant. Constat 20/10 : le clic était DÉLIVRÉ (isTrusted=true capté)
  *  mais la réponse au démon se perdait (timeout 25 s côté démon) — désormais
- *  pire cas ~16,5 s < 25 s : l'accusé de réception revient toujours. */
+ *  pire cas ~16,5 s < 25 s : l'accusé de réception revient toujours.
+ *  v0.5.4 : l'onglet est ACTIVÉ avant le geste — les Input.dispatch* pendent
+ *  sur un onglet non actif (constat : « geste natif incomplet » en
+ *  arrière-plan). L'activation reste INTERNE à la fenêtre Chrome : elle ne
+ *  vole pas le focus de l'OS (la fenêtre peut rester derrière une autre). */
 async function withDebugger(tabId, fn) {
+  try { await chrome.tabs.update(tabId, { active: true }); } catch (_) { /* fermé */ }
+  await sleepNat(180); // laisser le rendu de l'activation
   await chrome.debugger.attach({ tabId }, "1.3");
   const dbg = (method, params) => Promise.race([
     chrome.debugger.sendCommand({ tabId }, method, params),
