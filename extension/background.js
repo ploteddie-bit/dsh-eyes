@@ -587,9 +587,22 @@ const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
  *  v0.5.4 : l'onglet est ACTIVÉ avant le geste — les Input.dispatch* pendent
  *  sur un onglet non actif (constat : « geste natif incomplet » en
  *  arrière-plan). L'activation reste INTERNE à la fenêtre Chrome : elle ne
- *  vole pas le focus de l'OS (la fenêtre peut rester derrière une autre). */
-async function withDebugger(tabId, fn) {
+ *  vole pas le focus de l'OS (la fenêtre peut rester derrière une autre).
+ *  v0.6.0 : `focus` optionnel (défaut false) — amène AUSSI la fenêtre au
+ *  premier plan de l'OS. Constat GA4 20/10 : les Input CDP gèlent quand la
+ *  FENÊTRE entière est derrière une autre (rendu suspendu par Windows).
+ *  Vol de focus explicite = sur demande seulement (Eddie travaille). */
+async function withDebugger(tabId, fn, focus) {
   try { await chrome.tabs.update(tabId, { active: true }); } catch (_) { /* fermé */ }
+  if (focus) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const win = await chrome.windows.get(t.windowId);
+      const maj = { focused: true };
+      if (win.state === "minimized") maj.state = "maximized";
+      await chrome.windows.update(t.windowId, maj);
+    } catch (_) { /* fenêtre fermée */ }
+  }
   await sleepNat(180); // laisser le rendu de l'activation
   await chrome.debugger.attach({ tabId }, "1.3");
   const dbg = (method, params) => Promise.race([
@@ -650,7 +663,7 @@ async function lireRect(id, selector) {
 }
 
 /** Clic natif : trajectoire + hésitation + press/release (isTrusted=true). */
-async function cmdClickNative({ tab_id, selector }) {
+async function cmdClickNative({ tab_id, selector, focus }) {
   if (typeof selector !== "string" || !selector) {
     throw new Error("click_native: 'selector' (string) requis");
   }
@@ -673,7 +686,7 @@ async function cmdClickNative({ tab_id, selector }) {
       type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1,
     });
     return { clicked: selector, at: cible, native: true };
-  });
+  }, focus);
 }
 
 /** virtual-keycode minimal : lettres/chiffres/Espace/Entrée (reste → 0). */
@@ -786,28 +799,28 @@ async function chercherRectTexte(id, texte, exact) {
 
 /** Clic natif sur un élément repéré PAR TEXTE (GA4/Angular : pas de
  *  sélecteur stable, mais un libellé). Préfixe par défaut, exact:true sinon. */
-async function cmdClickNativeText({ tab_id, text, exact }) {
+async function cmdClickNativeText({ tab_id, text, exact, focus }) {
   if (typeof text !== "string" || !text) throw new Error("click_native_text: 'text' requis");
   const id = await resolveTabId(tab_id);
   const rect = await chercherRectTexte(id, text, exact);
   if (!rect) throw new Error("click_native_text: aucun élément portant le texte: " + text);
   if (rect.introuvable) throw new Error("click_native_text: élément « " + text + " » hors viewport (scroll_native d'abord)");
-  return clicNatifSurRect(id, rect, JSON.stringify(text));
+  return clicNatifSurRect(id, rect, JSON.stringify(text), focus);
 }
 
 /** Clic natif à des coordonnées viewport BRUTES — brique universelle :
  *  eval cherche par n'importe quelle logique, ce clic exécute. */
-async function cmdClickNativeRect({ tab_id, x, y }) {
+async function cmdClickNativeRect({ tab_id, x, y, focus }) {
   const px = Math.round(Number(x));
   const py = Math.round(Number(y));
   if (!Number.isFinite(px) || !Number.isFinite(py)) throw new Error("click_native_rect: 'x'/'y' requis");
   const id = await resolveTabId(tab_id);
-  return clicNatifSurRect(id, { x: px, y: py, w: 0, h: 0 }, px + "," + py);
+  return clicNatifSurRect(id, { x: px, y: py, w: 0, h: 0 }, px + "," + py, focus);
 }
 
 /** Cœur partagé des clics natifs : gaussienne dans le rect (si surface),
  *  trajectoire, hésitation, press/release — isTrusted=true. */
-async function clicNatifSurRect(id, rect, libelle) {
+async function clicNatifSurRect(id, rect, libelle, focus) {
   const cible = {
     x: Math.round(rect.x + (rect.w > 8 ? rect.w * fractionGaussienne() : 0)),
     y: Math.round(rect.y + (rect.h > 8 ? rect.h * fractionGaussienne() : 0)),
@@ -819,7 +832,7 @@ async function clicNatifSurRect(id, rect, libelle) {
     await sleepNat(45 + Math.random() * 50);
     await dbg("Input.dispatchMouseEvent", { type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
     return { clicked: libelle, at: cible, native: true };
-  });
+  }, focus);
 }
 
 /** Géométrie ÉCRAN d'un sélecteur : active l'onglet (le clic OS frappe ce
@@ -1259,6 +1272,15 @@ async function cmdScreenshot({ tab_id, format }) {
   const tab = await chrome.tabs.get(real_tab_id);
   if (!tab || typeof tab.windowId !== "number") {
     throw new Error("screenshot: onglet introuvable ou sans windowId");
+  }
+  // v0.6.0 : captureVisibleTab capture l'onglet ACTIF de la fenêtre —
+  // MYSTÈRE RÉSOLU (20/10) : sans activation, on photographiait TOUJOURS
+  // l'onglet actif (d'où les captures « figées », md5 identiques malgré
+  // la navigation du bon onglet). On active l'onglet demandé, on attend
+  // un rendu, on capture.
+  if (tab.active !== true) {
+    try { await chrome.tabs.update(real_tab_id, { active: true }); } catch (_) { /* fermé */ }
+    await new Promise((r) => setTimeout(r, 200));
   }
   const fmt = format === "jpeg" ? "jpeg" : "png";
   const data_url = await chrome.tabs.captureVisibleTab(tab.windowId, {
