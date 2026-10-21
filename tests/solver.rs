@@ -338,6 +338,7 @@ fn parse_status(raw: &str) -> u16 {
 
 async fn open_fake_extension(
     addr: SocketAddr,
+    token: &str,
     channel: &ExtensionChannel,
 ) -> (
     futures_util::stream::SplitStream<
@@ -348,7 +349,7 @@ async fn open_fake_extension(
         Message,
     >,
 ) {
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");
@@ -376,7 +377,7 @@ async fn solve_tier1_success() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     // Lance POST /v2/page/solve en tâche de fond.
     let token2 = token.clone();
@@ -431,7 +432,7 @@ async fn solve_tier1_fails_then_tier2() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -478,7 +479,7 @@ async fn solve_both_tiers_fail_returns_human_required() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -527,7 +528,7 @@ async fn solve_v3_invisible_returns_unsupported() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -572,7 +573,7 @@ async fn solve_no_captcha_returns_none() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -630,7 +631,7 @@ async fn solve_text_applied_via_fill_and_click() {
     let (url1, url2, _mock_state, _server_ollama) = start_mock_ollama(mock.clone()).await;
     let (token, addr, channel, _server_dsh) =
         start_server_with_urls(url1, url2).await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {

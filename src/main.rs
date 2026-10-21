@@ -12,6 +12,9 @@ mod vigil;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    // Rotation de démarrage : un JSONL > 50 Mo est archivé avant que
+    // les writers ne l'ouvrent en append.
+    ingest::rotate_logs_on_startup();
     let ctx = state::VigilCtx::new();
     // Hot-reload allowlist (Lot C — D4) : la tâche re-vérifie le mtime de
     // allowlist.json toutes les 25 s — les éditions manuelles sont prises

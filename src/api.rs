@@ -32,7 +32,7 @@
 
 use axum::{
     extract::rejection::JsonRejection,
-    extract::{Extension, Request},
+    extract::{Extension, Query, Request},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
@@ -66,6 +66,20 @@ pub async fn health() -> Json<Health> {
 /// Handler `GET /v2/ping` — endpoint trivial pour tester l'auth.
 async fn v2_ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// Handler `GET /v2/info` — version du démon et état du handshake
+/// extension (connectée, version, capacités). Sert au diagnostic de
+/// déploiement et au handshake de version démon ↔ extension.
+async fn v2_info(Extension(channel): Extension<ExtensionChannel>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "extension": {
+            "connected": channel.is_connected().await,
+            "hello": channel.hello().await,
+        }
+    }))
 }
 
 /// Corps de la requête `POST /v2/cmd`. Désérialisé en `Value` côté
@@ -244,12 +258,40 @@ pub fn actions_jsonl_path() -> PathBuf {
     home.join("actions.jsonl")
 }
 
+/// Masque les champs sensibles d'un détail d'action avant journalisation.
+/// Les clés sont volontairement larges : `value` (fill), `code` (eval),
+/// jetons et images base64. Le but est de garder une trace exploitable
+/// sans conserver de secret ni de gros payload.
+fn redact_params(mut value: Value) -> Value {
+    const SENSITIVE: [&str; 7] = [
+        "value",
+        "password",
+        "token",
+        "code",
+        "image_b64",
+        "data_url",
+        "b64",
+    ];
+    if let Value::Object(map) = &mut value {
+        for key in SENSITIVE {
+            if map.contains_key(key) {
+                map.insert(key.to_string(), json!("[redacted]"));
+            }
+        }
+    }
+    value
+}
+
 /// Journalise une action v2 dans `actions.jsonl` (Task 5 — traçabilité
 /// « toute action est loggée »). Fire-and-forget : l'échec d'écriture est
 /// loggé mais ne fait jamais échouer l'action métier.
 ///
 /// Format : `{"ts":<ms>,"action":"open|goto|click|fill|wait|cmd|solve","detail":{…}}`
 pub(crate) fn log_action(action: &str, detail: Value) {
+    // Masque les valeurs sensibles AVANT toute sérialisation : le
+    // journal d'actions ne doit jamais contenir un mot de passe, un
+    // code eval ou une image base64.
+    let detail = redact_params(detail);
     // Chemin capturé UNE SEULE FOIS au premier log (OnceLock process-wide) :
     // les tests qui modifient DSH_EYES_HOME en parallèle ne font plus
     // varier le dossier entre le moment de l'appel et l'écriture async.
@@ -296,6 +338,17 @@ async fn v2_cmd(
     Extension(channel): Extension<ExtensionChannel>,
     Json(req): Json<CmdRequest>,
 ) -> Response {
+    // Garde-fou SSRF centralisé : toute commande qui porte une URL
+    // passe par le même validateur que /v2/open et /v2/goto. Sans cela,
+    // `{"cmd":"tabs_create","params":{"url":"http://127.0.0.1/…"}}`
+    // contournait complètement `is_forbidden_host`.
+    if matches!(req.cmd.as_str(), "goto" | "tabs_create" | "open") {
+        if let Some(url) = req.params.get("url").and_then(|v| v.as_str()) {
+            if let Err(resp) = validate_target_url(url).await {
+                return resp;
+            }
+        }
+    }
     log_action(&req.cmd, req.params.clone());
     match send_cmd(&channel, req.cmd, req.params).await {
         Ok(result) => {
@@ -350,15 +403,8 @@ async fn v2_open(
         Some(u) => u,
         None => return error_response(StatusCode::BAD_REQUEST, "missing_url"),
     };
-    let host = match extract_host(url) {
-        Some(h) => h,
-        None => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_url");
-        }
-    };
-    if vigil::is_forbidden_host(&host) {
-        tracing::warn!(host = %host, "/v2/open : hôte interdit");
-        return error_response(StatusCode::FORBIDDEN, "forbidden_target");
+    if let Err(resp) = validate_target_url(url).await {
+        return resp;
     }
 
     // 2) Envoi via le canal. Paramètres = {"url": "<url>"}. On inclut
@@ -471,13 +517,8 @@ async fn v2_goto(
         Some(u) => u,
         None => return error_response(StatusCode::BAD_REQUEST, "missing_url"),
     };
-    let host = match extract_host(url) {
-        Some(h) => h,
-        None => return error_response(StatusCode::BAD_REQUEST, "invalid_url"),
-    };
-    if vigil::is_forbidden_host(&host) {
-        tracing::warn!(host = %host, "/v2/goto : hôte interdit");
-        return error_response(StatusCode::FORBIDDEN, "forbidden_target");
+    if let Err(resp) = validate_target_url(url).await {
+        return resp;
     }
     let params = json!({ "url": url, "active": true });
     log_action("goto", params.clone());
@@ -758,29 +799,63 @@ async fn v2_page_group(
     }
 }
 
-/// Extrait le host (schéma + autorité) d'une URL `http://host[:port]/…`
-/// ou `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
+/// Extrait le host d'une URL `http://host[:port]/…` ou
+/// `https://host[:port]/…`. Retourne `None` si l'URL est mal formée.
 ///
-/// On évite la dépendance à `url::Url` (légère mais optionnelle) — un
-/// split sur `://` puis sur `/` suffit pour les formes canoniques.
-/// C'est ce que fait aussi l'extension (`new URL(...)`) pour `webRequest`.
+/// Refuse les userinfo (`http://user@host/`), les schémas autres que
+/// http/https et les autorités vides. Les crochets IPv6 sont décodés.
 fn extract_host(url: &str) -> Option<String> {
-    // Schéma http ou https uniquement (pas de file://, ws://, javascript:).
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
-    let authority = rest.split('/').next()?;
-    let host = authority.split(':').next()?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        &stripped[..end]
+    } else {
+        authority.split(':').next()?
+    };
     if host.is_empty() {
         return None;
     }
-    // Décode les crochets IPv6 : `http://[::1]/` → `::1`.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| host.to_string());
-    Some(host)
+    Some(host.to_ascii_lowercase())
+}
+
+/// Valide une URL de navigation avant de l'envoyer à l'extension.
+///
+/// Deux niveaux :
+/// 1. `is_forbidden_host` sur le host littéral (localhost, IP privées,
+///    formes numériques déguisées).
+/// 2. Résolution DNS (timeout 3 s) : toute adresse résolue loopback /
+///    privée / link-local / ULA est refusée. Couvre `127.0.0.1.nip.io`.
+///
+/// Un échec de résolution (DNS indisponible) n'est pas bloquant : la
+/// navigation échouera d'elle-même, et bloquer casserait les domaines
+/// légitimes dont le DNS est lent. La limite est documentée.
+async fn validate_target_url(url: &str) -> Result<(), Response> {
+    let host = extract_host(url)
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "invalid_url"))?;
+    if vigil::is_forbidden_host(&host) {
+        tracing::warn!(host = %host, "cible interdite (hôte)");
+        return Err(error_response(StatusCode::FORBIDDEN, "forbidden_target"));
+    }
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::lookup_host((host.as_str(), 0)),
+    )
+    .await;
+    if let Ok(Ok(addrs)) = lookup {
+        for addr in addrs {
+            if vigil::is_forbidden_ip(&addr.ip()) {
+                tracing::warn!(host = %host, ip = %addr.ip(), "cible interdite (DNS)");
+                return Err(error_response(StatusCode::FORBIDDEN, "forbidden_target"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
@@ -797,6 +872,7 @@ fn v2_router(
 ) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
+        .route("/info", get(v2_info))
         .route("/cmd", post(v2_cmd))
         .route("/open", post(v2_open))
         .route("/read", post(v2_read))
@@ -829,10 +905,19 @@ fn v2_router(
         .layer(Extension(record))
 }
 
+/// Query string de `/events` : `?limit=N` (défaut 50, plafonné à 200).
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    pub limit: Option<usize>,
+}
+
 /// Handler `GET /events` — retourne les N dernières alertes en JSON.
-async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoResponse {
-    const EVENTS_TAIL: usize = 50;
-    let from_buffer = ctx.alerts.tail(EVENTS_TAIL).await;
+async fn events_handler(
+    Extension(ctx): Extension<VigilCtx>,
+    Query(q): Query<EventsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let from_buffer = ctx.alerts.tail(limit).await;
     if !from_buffer.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!(from_buffer))).into_response();
     }
@@ -846,7 +931,7 @@ async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoRespons
                 .into_response();
         }
     };
-    match vigil::tail_jsonl(&path, EVENTS_TAIL) {
+    match vigil::tail_jsonl(&path, limit) {
         Ok(values) => (StatusCode::OK, Json(values)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -863,14 +948,22 @@ async fn events_handler(Extension(ctx): Extension<VigilCtx>) -> impl IntoRespons
 /// référence pour identifier l'extension bidirectionnelle. En v1 pur
 /// (sans REWORK), un `ExtensionChannel::new()` vide suffit — il ne
 /// sera jamais interrogé.
-pub fn router(ctx: VigilCtx, channel: ExtensionChannel) -> Router {
+fn router_with_auth(ctx: VigilCtx, channel: ExtensionChannel, auth_token: String) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/events", get(events_handler))
         .merge(crate::ingest::ws_router())
         .merge(crate::stats::stats_router())
+        .layer(Extension(AuthToken(auth_token)))
         .layer(Extension(channel))
         .layer(Extension(ctx))
+}
+
+/// Routeur v1 sans auth WS (mode test / intégration v1). Le binaire de
+/// production utilise `router_with_v2`, qui injecte le token réel.
+#[allow(dead_code)]
+pub fn router(ctx: VigilCtx, channel: ExtensionChannel) -> Router {
+    router_with_auth(ctx, channel, String::new())
 }
 
 /// Router v1 + sous-router `/v2` protégé par `auth::require_token`.
@@ -885,10 +978,11 @@ pub fn router_with_v2(
     config: Config,
     channel: ExtensionChannel,
 ) -> Router {
-    router(ctx, channel.clone()).nest(
+    let token = config.api_token().to_string();
+    router_with_auth(ctx, channel.clone(), token.clone()).nest(
         "/v2",
         v2_router(
-            config.api_token().to_string(),
+            token,
             // **Lot B — D2 (2026-10-07)** : on extrait le sous-ensemble
             // solveur (URLs + modèle) une seule fois à la construction
             // du router, puis `v2_router` l'injecte via `Extension`

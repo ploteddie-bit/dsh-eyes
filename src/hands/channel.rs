@@ -99,6 +99,17 @@ impl Response {
 /// stocke donc un `Arc<UnboundedSender<String>>` en interne pour avoir
 /// une adresse stable. Les callers peuvent ainsi comparer leur sender
 /// (via `Arc::ptr_eq`) à celui enregistré et décider de le remplacer.
+/// Informations de handshake envoyées par l'extension à l'ouverture
+/// de la WS (`{"hello": {...}}`). Sert à `/v2/info` et au diagnostic
+/// de version démon ↔ extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloInfo {
+    pub client: String,
+    pub version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
 pub type ExtensionSink = mpsc::UnboundedSender<String>;
 
 /// Wrapper identité-stable autour d'un `ExtensionSink`. Les clones
@@ -144,6 +155,8 @@ struct Inner {
     sink: Mutex<Option<SinkHandle>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Response>>>,
     next_id: AtomicU64,
+    /// Dernier `hello` reçu de l'extension (version, client, capacités).
+    hello: Mutex<Option<HelloInfo>>,
 }
 
 /// Timeout par défaut d'attente de réponse d'une commande.
@@ -182,6 +195,7 @@ impl ExtensionChannel {
                 sink: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
+                hello: Mutex::new(None),
             }),
         }
     }
@@ -198,6 +212,10 @@ impl ExtensionChannel {
     pub async fn register(&self, handle: SinkHandle) {
         // Purge des requêtes en attente de l'ancien sink.
         Self::fail_all_pending(&self.inner.pending, "extension_disconnected").await;
+        // Un nouveau sink n'a pas encore envoyé son hello : on efface
+        // celui de la connexion précédente pour que `/v2/info` ne
+        // présente pas une version périmée.
+        *self.inner.hello.lock().await = None;
         let mut g = self.inner.sink.lock().await;
         *g = Some(handle);
     }
@@ -212,15 +230,25 @@ impl ExtensionChannel {
         if g.as_ref().is_some_and(|s| s.same_handle(handle)) {
             *g = None;
             drop(g);
+            *self.inner.hello.lock().await = None;
             Self::fail_all_pending(&self.inner.pending, "extension_disconnected").await;
         }
     }
 
     /// Indique si une extension est actuellement enregistrée.
-    /// Indique si une extension est actuellement enregistrée.
     #[allow(dead_code)] // API publique — utilisée par les tests, pas le binaire
     pub async fn is_connected(&self) -> bool {
         self.inner.sink.lock().await.is_some()
+    }
+
+    /// Enregistre le dernier `hello` reçu de l'extension.
+    pub async fn set_hello(&self, hello: HelloInfo) {
+        *self.inner.hello.lock().await = Some(hello);
+    }
+
+    /// Retourne le dernier `hello` reçu, s'il y en a un.
+    pub async fn hello(&self) -> Option<HelloInfo> {
+        self.inner.hello.lock().await.clone()
     }
 
     /// Pousse une commande vers l'extension et attend la réponse, avec

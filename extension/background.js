@@ -22,7 +22,7 @@
 const WS_URL = "ws://127.0.0.1:8445/ws";
 
 // v2.1 — couche de comportement humain (port ghost-cursor).
-import { humanMousePath, humanTypingPlan } from "./humanize-math.js";
+import { humanMousePath, humanTypingPlan, humanScrollPlan } from "./humanize-math.js";
 
 // Dernière position de curseur connue par onglet (les injections de
 // trajectoire démarrent d'ici — jamais du même point deux fois de suite).
@@ -43,6 +43,22 @@ let backoff = BACKOFF_MIN_MS;
 let reconnectTimer = null;
 let connecting = false;
 let closedByWorker = false;
+
+// Le token vit dans chrome.storage.local (clé `dsh_token`). Quand
+// l'utilisateur le modifie dans les options, on force une reconnexion
+// propre sans attendre le backoff.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.dsh_token) return;
+  log("token modifié — reconnexion");
+  closedByWorker = true;
+  if (ws) {
+    try { ws.close(); } catch (_) { /* déjà fermée */ }
+  }
+  ws = null;
+  backoff = BACKOFF_MIN_MS;
+  closedByWorker = false;
+  setTimeout(connect, 100);
+});
 
 // Log dans la console du service worker (visible depuis chrome://extensions
 // → "Inspecter le service worker" → onglet Console).
@@ -105,12 +121,26 @@ function scheduleReconnect() {
 
 // Tente d'ouvrir la WS. Au succès → drain de la FIFO. À l'échec →
 // backoff × 2 (plafonné à BACKOFF_MAX_MS) puis re-planification.
-function connect() {
+async function connect() {
   if (connecting || (ws && ws.readyState === WebSocket.OPEN)) return;
   connecting = true;
   closedByWorker = false;
+  let token = "";
   try {
-    ws = new WebSocket(WS_URL);
+    const stored = await chrome.storage.local.get({ dsh_token: "" });
+    token = String(stored.dsh_token || "").trim();
+  } catch (e) {
+    log("lecture du token impossible :", e && e.message);
+  }
+  if (!token) {
+    connecting = false;
+    log("token absent — renseigne-le dans les options de l'extension (clic droit sur l'icône → Options)");
+    backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+    scheduleReconnect();
+    return;
+  }
+  try {
+    ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
   } catch (e) {
     connecting = false;
     log("échec new WebSocket :", e && e.message);
@@ -123,6 +153,23 @@ function connect() {
     log("WS ouverte");
     connecting = false;
     backoff = BACKOFF_MIN_MS;     // reset du backoff sur succès
+    // Handshake de version/capacités : le démon l'expose via /v2/info.
+    try {
+      ws.send(JSON.stringify({
+        hello: {
+          client: "dsh-eyes-extension",
+          version: chrome.runtime.getManifest().version,
+          capabilities: [
+            "read", "find", "click", "fill", "eval",
+            "click_native", "click_native_text", "click_native_rect",
+            "type_native", "scroll_native", "screen_pos",
+            "screenshot", "captcha_detect", "record",
+          ],
+        },
+      }));
+    } catch (e) {
+      log("hello: envoi impossible :", e && e.message);
+    }
     drainQueue();
     // Keep-alive (REWORK v2.1) : alarme 25 s — réveille le worker AVANT
     // sa suspension MV3 (~30 s) et maintient la WS ouverte en permanence.
@@ -130,20 +177,25 @@ function connect() {
   });
 
   // Réagit à l'alarme keep-alive : ping WS (ou reconnect si morte).
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name !== "dsh-eyes-keepalive") return;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ ping: Date.now() }));
-      } catch (e) {
-        log("keep-alive : send a échoué, reconnexion :", e && e.message);
+  // Garde d'idempotence : `connect()` est rappelé à chaque reconnexion ;
+  // sans ce flag, chaque appel ajoutait un listener (fuite observée).
+  if (!globalThis.__dshAlarmListenerInstalled) {
+    globalThis.__dshAlarmListenerInstalled = true;
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name !== "dsh-eyes-keepalive") return;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ ping: Date.now() }));
+        } catch (e) {
+          log("keep-alive : send a échoué, reconnexion :", e && e.message);
+          scheduleReconnect();
+        }
+      } else {
+        log("keep-alive : WS fermée, reconnexion");
         scheduleReconnect();
       }
-    } else {
-      log("keep-alive : WS fermée, reconnexion");
-      scheduleReconnect();
-    }
-  });
+    });
+  }
 
   ws.addEventListener("message", (ev) => {
     let payload = null;
@@ -473,11 +525,19 @@ async function cmdTabsCreate({ url, group_title }) {
   // est adopté dans le groupe (migration propre au premier passage).
   const existing = await findTabByUrl(url);
   if (existing) {
-    await chrome.tabs.update(existing.id, { active: true });
-    await waitForTabComplete(existing.id);
+    // `findTabByUrl` déduplique sur origin+pathname (query/hash ignorés).
+    // Il faut donc NAVIGUER l'onglet réutilisé vers l'URL demandée :
+    // sinon `tabs_create` renvoie l'ancienne page et le démon pilote la
+    // mauvaise URL (bug observé sur les SPA à query/hash).
+    if (existing.url !== url) {
+      await chrome.tabs.update(existing.id, { url, active: true });
+      await waitForTabComplete(existing.id);
+    } else {
+      await chrome.tabs.update(existing.id, { active: true });
+    }
     const reponse_existante = {
       tab_id: existing.id,
-      url: existing.url || url,
+      url,
       reused: true,
       window_id: existing.windowId,
     };
@@ -766,17 +826,16 @@ function fractionGaussienne(lo = 0.2, hi = 0.8) {
   return Math.min(hi, Math.max(lo, 0.5 + g * 0.15));
 }
 
-/** Trajectoire courte vers la cible : 3-8 mouseMoved interpolés, cadence
- *  irrégulière, part du dernier point connu — jamais de téléportation. */
+/** Trajectoire Bézier humaine (overshoot, bruit, vitesse en cloche) via
+ *  humanMousePath — part du dernier point connu, jamais de téléportation.
+ *  Les gestes CDP héritent ainsi de la même humanisation que les gestes JS,
+ *  au lieu d'une interpolation linéaire en 3-8 points. */
 async function deplacerCurseur(dbg, tabId, cible) {
   const dep = nativeCursor.get(tabId) || { x: 8, y: Math.round(120 + Math.random() * 240) };
-  const etapes = 3 + Math.floor(Math.random() * 5);
-  for (let i = 1; i <= etapes; i++) {
-    const t = i / etapes;
-    const x = Math.round(dep.x + (cible.x - dep.x) * t + (Math.random() - 0.5) * 2);
-    const y = Math.round(dep.y + (cible.y - dep.y) * t + (Math.random() - 0.5) * 2);
-    await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await sleepNat(8 + Math.random() * 17);
+  const { points } = humanMousePath(dep, cible, { jitter: 24 });
+  for (const p of points) {
+    await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+    await sleepNat(p.delayMs);
   }
   nativeCursor.set(tabId, cible);
 }
@@ -843,16 +902,32 @@ async function cmdTypeNative({ tab_id, selector, text, submit }) {
     if (!res || !res.result) throw new Error("type_native: sélecteur introuvable: " + selector);
   }
   return withDebugger(id, async (dbg) => {
-    for (const ch of text) {
-      await dbg("Input.dispatchKeyEvent", {
-        type: "keyDown", key: ch, text: ch, unmodifiedText: ch,
-        windowsVirtualKeyCode: vkDe(ch), nativeVirtualKeyCode: vkDe(ch),
-      });
-      await sleepNat(40 + Math.random() * 120);
-      await dbg("Input.dispatchKeyEvent", {
-        type: "keyUp", key: ch, windowsVirtualKeyCode: vkDe(ch),
-      });
-      await sleepNat(15 + Math.random() * 45);
+    // Plan de frappe humain : délais lognormaux, typos QWERTY (~3 %) et
+    // corrections backspace. Les gestes CDP ne sont plus une frappe
+    // mécanique à dwell fixe.
+    const plan = humanTypingPlan(text);
+    for (const step of plan) {
+      if (step.type === "backspace") {
+        await dbg("Input.dispatchKeyEvent", {
+          type: "keyDown", key: "Backspace", code: "Backspace",
+          windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+        });
+        await sleepNat(25 + Math.random() * 35);
+        await dbg("Input.dispatchKeyEvent", {
+          type: "keyUp", key: "Backspace", code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+      } else {
+        await dbg("Input.dispatchKeyEvent", {
+          type: "keyDown", key: step.ch, text: step.ch, unmodifiedText: step.ch,
+          windowsVirtualKeyCode: vkDe(step.ch), nativeVirtualKeyCode: vkDe(step.ch),
+        });
+        await sleepNat(20 + Math.random() * 30);
+        await dbg("Input.dispatchKeyEvent", {
+          type: "keyUp", key: step.ch, windowsVirtualKeyCode: vkDe(step.ch),
+        });
+      }
+      await sleepNat(step.delayMs);
     }
     if (submit) {
       await sleepNat(60 + Math.random() * 90);
@@ -878,18 +953,23 @@ async function cmdScrollNative({ tab_id, dy }) {
   }
   const id = await resolveTabId(tab_id);
   const sens = Math.sign(total);
-  let reste = Math.abs(total);
+  // Plan de scroll humain : crans progressifs 80-300 px, accélération puis
+  // freinage, délais 120-450 ms. Remplace la boucle mécanique 90-135 px.
+  const plan = humanScrollPlan(Math.abs(total), { direction: sens > 0 ? "down" : "up" });
   return withDebugger(id, async (dbg) => {
     let crans = 0;
-    while (reste > 0) {
-      const cran = Math.min(reste, 90 + Math.floor(Math.random() * 46));
-      reste -= cran;
+    for (const step of plan) {
       const p = nativeCursor.get(id) || { x: 400, y: 320 };
+      if (!nativeCursor.has(id)) {
+        await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+        await sleepNat(80 + Math.random() * 120);
+      }
       await dbg("Input.dispatchMouseEvent", {
-        type: "mouseWheel", x: p.x, y: p.y, deltaX: 0, deltaY: sens * cran,
+        type: "mouseWheel", x: p.x, y: p.y, deltaX: 0,
+        deltaY: step.direction === "up" ? -step.px : step.px,
       });
       crans += 1;
-      await sleepNat(30 + Math.random() * 40);
+      await sleepNat(step.delayMs);
     }
     return { scrolled: total, crans, native: true };
   });

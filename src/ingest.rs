@@ -34,9 +34,10 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Extension,
+        Extension, Query,
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -47,9 +48,25 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 
-use crate::hands::channel::{ExtensionChannel, Response as ExtResponse, SinkHandle};
+use crate::auth::{ct_eq, AuthToken};
+use crate::hands::channel::{ExtensionChannel, HelloInfo, Response as ExtResponse, SinkHandle};
 use crate::state::VigilCtx;
 use crate::vigil::{self, Alert, AlertLevel};
+
+/// Query string de `/ws` : le token d'API est passé en paramètre
+/// (`?token=...`) car l'API WebSocket des navigateurs ne permet pas
+/// d'envoyer un header `Authorization` personnalisé.
+#[derive(Debug, Deserialize)]
+pub struct WsQuery {
+    pub token: Option<String>,
+}
+
+/// Enveloppe du handshake envoyé par l'extension à l'ouverture :
+/// `{"hello":{"client":"…","version":"…","capabilities":[…]}}`.
+#[derive(Debug, Deserialize)]
+struct HelloEnvelope {
+    hello: HelloInfo,
+}
 
 /// Format d'un événement de navigation reçu sur WS.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -218,9 +235,21 @@ async fn writer_loop(path: PathBuf, mut rx: mpsc::UnboundedReceiver<NavEvent>) {
 /// Récupère l'état partagé (vigil + canal extension) via `Extension`.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    Query(q): Query<WsQuery>,
     Extension(ctx): Extension<VigilCtx>,
     Extension(channel): Extension<ExtensionChannel>,
+    Extension(auth): Extension<AuthToken>,
 ) -> Response {
+    // Auth par token en query string. Un token vide désactive la
+    // vérification (tests v1) ; en production `router_with_v2` injecte
+    // toujours le token réel.
+    if !auth.0.is_empty() {
+        let presented = q.token.as_deref().unwrap_or("");
+        if !ct_eq(auth.0.as_bytes(), presented.as_bytes()) {
+            tracing::warn!("/ws : token absent ou invalide");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, ctx, channel))
 }
 
@@ -329,9 +358,10 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
         Err(e) => {
             let _ = send_text(&local_tx, Ack::err(format!("chemin persistance invalide: {e}")));
             channel.unregister(&handle).await;
+            drop(handle);
+            let _ = tokio::time::timeout(Duration::from_secs(2), bridge_task).await;
             drop(local_tx);
-            let _ = pump_task.await;
-            let _ = bridge_task.await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), pump_task).await;
             return;
         }
     };
@@ -370,6 +400,22 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
                 if let Ok(resp) = serde_json::from_str::<ExtResponse>(&raw) {
                     if !channel.dispatch_response(resp).await {
                         tracing::debug!("réponse orpheline reçue et ignorée");
+                    }
+                    continue;
+                }
+
+                // Handshake de version/capacités envoyé par l'extension
+                // à l'ouverture de la WS.
+                if let Ok(HelloEnvelope { hello }) = serde_json::from_str::<HelloEnvelope>(&raw) {
+                    tracing::info!(
+                        client = %hello.client,
+                        version = %hello.version,
+                        capabilities = ?hello.capabilities,
+                        "handshake extension reçu"
+                    );
+                    channel.set_hello(hello).await;
+                    if !send_text(&local_tx, Ack::ok()) {
+                        break;
                     }
                     continue;
                 }
@@ -427,9 +473,14 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
     // les senders, et on attend la fin de la tâche écrivain
     // (EventWriter) pour garantir le flush final (0 event perdu).
     channel.unregister(&handle).await;
+    // Fermer d'abord le sender de l'extension : le bridge attend
+    // `ext_rx`, qui ne se ferme qu'au drop du dernier `SinkHandle`.
+    // Sans ce drop, le bridge ne termine jamais et la socket reste
+    // en CLOSE-WAIT (fuite observée le 21/10).
+    drop(handle);
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge_task).await;
     drop(local_tx);
-    let _ = pump_task.await;
-    let _ = bridge_task.await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), pump_task).await;
     // `event_writer` est droppé implicitement à la sortie de scope
     // (sender fermée → task écrivain voit `Ok(None)` → flush final).
     // `writer_task` est joinée après le drop.
@@ -437,8 +488,6 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
     if let Err(e) = writer_task.await {
         tracing::warn!(error = %e, "EventWriter: join final a échoué");
     }
-    // `handle` est droppé en sortie de scope.
-    let _ = handle;
 }
 
 /// Calcule le chemin de `events.jsonl` à partir de `DSH_EYES_HOME`.
@@ -462,6 +511,46 @@ fn default_home() -> std::io::Result<PathBuf> {
         std::io::ErrorKind::NotFound,
         "ni HOME ni USERPROFILE défini",
     ))
+}
+
+/// Rotation de démarrage des journaux JSONL. Un fichier qui dépasse
+/// 50 Mo est renommé en `.1`, les archives existantes glissent
+/// (`.1`→`.2`, `.2`→`.3`) et la plus ancienne est supprimée.
+/// Appelée une fois dans `main` avant l'ouverture des writers.
+pub fn rotate_logs_on_startup() {
+    const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
+    const KEEP: usize = 3;
+    let home = match default_home() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "rotation des logs ignorée : home introuvable");
+            return;
+        }
+    };
+    for name in ["events.jsonl", "alerts.jsonl", "actions.jsonl"] {
+        let path = home.join(name);
+        let too_big = std::fs::metadata(&path)
+            .map(|m| m.len() > MAX_LOG_BYTES)
+            .unwrap_or(false);
+        if !too_big {
+            continue;
+        }
+        let oldest = path.with_extension(format!("jsonl.{KEEP}"));
+        let _ = std::fs::remove_file(&oldest);
+        for i in (1..KEEP).rev() {
+            let from = path.with_extension(format!("jsonl.{i}"));
+            let to = path.with_extension(format!("jsonl.{}", i + 1));
+            if from.exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
+        let archive = path.with_extension("jsonl.1");
+        if let Err(e) = std::fs::rename(&path, &archive) {
+            tracing::warn!(error = %e, path = %path.display(), "rotation du log échouée");
+        } else {
+            tracing::info!(path = %path.display(), archive = %archive.display(), "log rotaté (dépassement 50 Mo)");
+        }
+    }
 }
 
 async fn append_alert(path: &std::path::Path, alert: &Alert) -> std::io::Result<()> {

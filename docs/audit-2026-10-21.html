@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH Eyes — audit et plan d'amélioration</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --card2:#1c232c; --bord:#21262d; --text:#e6edf3; --muted:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --orange:#f97316; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; }
+  main { max-width:1180px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:28px; margin:0 0 6px; }
+  h2 { font-size:20px; margin:38px 0 12px; border-bottom:1px solid var(--bord); padding-bottom:6px; color:var(--orange); }
+  h3 { font-size:16px; margin:22px 0 8px; }
+  .sub { color:var(--muted); margin:0 0 22px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--bord); border-radius:9px; padding:14px 16px; }
+  .card .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  .card .v { font-size:17px; font-weight:600; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--bord); border-radius:9px; overflow:hidden; margin:10px 0 18px; }
+  th,td { text-align:left; padding:9px 11px; border-bottom:1px solid var(--bord); vertical-align:top; font-size:14px; }
+  th { background:#212a33; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  code { background:#212a33; padding:1px 5px; border-radius:4px; font-size:12.5px; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .tag { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px; margin-right:4px; }
+  .t-crit { background:#3a1e1e; color:var(--bad); }
+  .t-high { background:#332a14; color:var(--warn); }
+  .t-mid { background:#1f2d3d; color:var(--accent); }
+  .t-low { background:#1c232c; color:var(--muted); }
+  ul,ol { margin:8px 0 8px 20px; padding:0; }
+  li { margin:4px 0; }
+  .note { background:#1c2632; border-left:3px solid var(--accent); padding:12px 16px; border-radius:0 7px 7px 0; margin:14px 0; }
+  .phase { background:var(--card); border:1px solid var(--bord); border-left:4px solid var(--orange); border-radius:9px; padding:12px 16px; margin:10px 0; }
+  .phase b { color:var(--orange); }
+  footer { color:var(--muted); font-size:12px; margin-top:48px; border-top:1px solid var(--bord); padding-top:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DSH Eyes — audit technique et plan d'amélioration</h1>
+  <p class="sub">Contrôle du Chrome personnel par M2M et par navigation humaine · audit du 21 octobre 2026 · sources : HEAD <code>7fe4a38</code>, runtime local, trois audits de code</p>
+
+  <div class="grid">
+    <div class="card"><div class="k">Démon Rust</div><div class="v">1.0.0 · actif</div></div>
+    <div class="card"><div class="k">Extension chargée</div><div class="v">1.0.2</div></div>
+    <div class="card"><div class="k">Commandes extension</div><div class="v">19</div></div>
+    <div class="card"><div class="k">Outils MCP</div><div class="v">9 · non configurés</div></div>
+    <div class="card"><div class="k">Tests Rust</div><div class="v">124 · 2 ignorés</div></div>
+  </div>
+
+  <h2>Résumé exécutif</h2>
+  <p>DSH Eyes est déjà un outil avancé : démon Rust léger, extension MV3 à 19 commandes, huit gestes natifs via <code>chrome.debugger</code>, vigie de navigation, solveur de captcha en cascade, enregistrement d'écran et serveur MCP. Le socle fonctionne : <code>/health</code> répond, le canal se rétablit, <code>tabs_create</code> et <code>read mode:outline</code> répondent en moins d'une seconde.</p>
+  <p>Mais le niveau de fiabilité n'est pas encore celui d'un pilotage M2M autonome. Cinq problèmes dominent :</p>
+  <ol>
+    <li><b class="bad">Canal WebSocket sans authentification et « dernière connexion gagne »</b> : un test ou une page web peut remplacer l'extension et tuer le canal. Prouvé pendant l'audit.</li>
+    <li><b class="bad">Fuite de sockets</b> : deadlock à la fermeture WS, 15 sockets <code>CLOSE-WAIT</code> accumulés en 8 h ; disparus au redémarrage.</li>
+    <li><b class="bad">SSRF via <code>/v2/cmd</code></b> : le garde-fou d'hôte n'est appliqué qu'à <code>/v2/open</code> et <code>/v2/goto</code>.</li>
+    <li><b class="warn">Humanisation inversée</b> : les gestes natifs (<code>isTrusted=true</code>) ont les trajectoires les moins humaines ; la belle humanisation est branchée sur les gestes JS détectables.</li>
+    <li><b class="warn">Déploiement fragmenté</b> : trois copies de l'extension, noms de dossiers trompeurs, aucun handshake de version, MCP absent de VS Code.</li>
+  </ol>
+
+  <h2>1. Périmètre et versions réelles</h2>
+  <table>
+    <thead><tr><th>Composant</th><th>Version / état</th><th>Preuve</th></tr></thead>
+    <tbody>
+      <tr><td>Démon Rust</td><td>1.0.0, service user actif, 4,6 Mo RSS</td><td><code>/health</code> ; <code>Cargo.toml</code></td></tr>
+      <tr><td>Extension — source</td><td>1.0.2, commit <code>7fe4a38</code></td><td><code>extension/manifest.json</code></td></tr>
+      <tr><td>Extension — chargée par Chrome</td><td>1.0.2</td><td><code>Profile 16/Secure Preferences</code> → <code>Downloads\dsh-eyes-extension-1.0.0</code> ; manifest 1.0.2 ; <code>background.js</code> identique à la source</td></tr>
+      <tr><td>Extension — copie <code>~/.dsh-eyes/extension</code></td><td>1.0.0, <b>non chargée</b></td><td>manifest 1.0.0, <code>background.js</code> 65 282 o (fantôme)</td></tr>
+      <tr><td>Serveur MCP</td><td>1.0.0, 9 outils, aucun client configuré</td><td><code>mcp-server/server.js</code> ; aucune config VS Code/Kimi</td></tr>
+      <tr><td>Dépôt GitHub</td><td><code>ploteddie-bit/dsh-eyes</code>, main = <code>7fe4a38</code></td><td><code>git remote -v</code> ; <code>git log</code></td></tr>
+      <tr><td>Dépôt Forgejo</td><td>retard de 5 commits</td><td><code>git log forgejo/main..github/main</code></td></tr>
+      <tr><td>Tags / releases</td><td>seul <code>v0.6.0</code> ; pas de tag 1.0.1 ni 1.0.2</td><td><code>git tag</code> ; <code>git ls-remote --tags</code></td></tr>
+      <tr><td>Tests</td><td>124 passés, 2 ignorés ; <code>record.rs</code> et <code>hands</code> non couverts</td><td><code>cargo test</code> (rapport) ; fichiers <code>tests/</code></td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>Point de déploiement.</b> Le dossier <code>Downloads\dsh-eyes-extension-1.0.0</code> contient en réalité la 1.0.2 : le nom du dossier n'est pas la version. La copie <code>~/.dsh-eyes/extension</code> en 1.0.0 est une source de confusion et n'est jamais chargée. Le dépôt GitHub est la seule source de vérité, mais Forgejo est en retard.</div>
+
+  <h2>2. Architecture actuelle</h2>
+  <p><code>Chrome (extension MV3)</code> ↔ WebSocket <code>ws://127.0.0.1:8445/ws</code> ↔ <code>démon Rust (axum + tokio)</code> → routes HTTP v1/v2 et serveur MCP stdio. L'extension sert à la fois de vigie (événements de navigation) et de mains (exécution des commandes via <code>chrome.tabs</code>, <code>chrome.scripting</code> et <code>chrome.debugger</code>).</p>
+  <ul>
+    <li><b>Routes v1 ouvertes</b> : <code>/health</code>, <code>/stats</code>, <code>/events</code>, <code>/ws</code>.</li>
+    <li><b>Routes v2 avec Bearer</b> : <code>/v2/ping</code>, <code>/v2/cmd</code>, <code>/v2/open</code>, <code>/v2/read</code>, <code>/v2/goto</code>, <code>/v2/click</code>, <code>/v2/fill</code>, <code>/v2/wait</code>, <code>/v2/record/*</code>, <code>/v2/page/*</code>.</li>
+    <li><b>Concurrence</b> : globale, pas par onglet côté démon ; un seul sink « dernière connexion gagne » ; sérialisation par onglet côté extension seulement.</li>
+    <li><b>Timeouts</b> : extension 30 s, geste natif 15-24 s, commande globale 25 s, Ollama 60 s/tier.</li>
+  </ul>
+
+  <h2>3. Fonctionnalités existantes</h2>
+  <table>
+    <thead><tr><th>Famille</th><th>Commandes / routes</th><th>État</th></tr></thead>
+    <tbody>
+      <tr><td>Navigation et onglets</td><td><code>tabs_create</code>, <code>goto</code>, <code>tab_group</code>, <code>tab_activate</code></td><td class="ok">Fonctionnel</td></tr>
+      <tr><td>Lecture</td><td><code>read</code> (text / outline), <code>find</code></td><td class="ok">Fonctionnel</td></tr>
+      <tr><td>Interaction JS</td><td><code>click</code>, <code>fill</code>, <code>eval</code>, <code>wait</code>, <code>wait_for</code></td><td class="warn">Détectable (<code>isTrusted=false</code>)</td></tr>
+      <tr><td>Interaction native CDP</td><td><code>click_native</code>, <code>click_native_text</code>, <code>click_native_rect</code>, <code>type_native</code>, <code>scroll_native</code>, <code>screen_pos</code></td><td class="warn">Fonctionnel, humanisation faible</td></tr>
+      <tr><td>Capture et preuve</td><td><code>screenshot</code>, <code>captcha_detect</code>, <code>/v2/record/start|stop|status</code></td><td class="warn">Screenshot 1.0.2 OK ; record non testé</td></tr>
+      <tr><td>Vigie</td><td><code>/stats</code>, <code>/events</code>, <code>/alerts</code>, allowlist</td><td class="ok">Fonctionnel</td></tr>
+      <tr><td>Solveur captcha</td><td><code>/v2/page/solve</code>, cascade Ollama tier1 → tier2 → humain</td><td class="ok">Fonctionnel, non testé en live</td></tr>
+      <tr><td>MCP</td><td>9 outils : ping, open, goto, read, click, fill, wait, screenshot, events</td><td class="bad">Absent de VS Code ; 5 schémas/descriptions faux</td></tr>
+    </tbody>
+  </table>
+
+  <h2>4. Bugs et angles morts</h2>
+  <table>
+    <thead><tr><th>Sévérité</th><th>Constat</th><th>Preuve</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag t-crit">Critique</span></td><td><b><code>/ws</code> sans auth ni contrôle d'Origin, « dernière connexion gagne »</b> : une page web ou un process local peut remplacer l'extension, intercepter les commandes et forger les réponses.</td><td><code>ingest.rs:219-225</code>, <code>hands/channel.rs:198-203</code> ; test : handshake 101 sans token, puis 504 permanents</td></tr>
+      <tr><td><span class="tag t-crit">Critique</span></td><td><b>Deadlock de fermeture WS</b> : le bridge attend un canal qui ne se ferme qu'après les awaits → socket jamais libérée, task suspendue à vie.</td><td><code>ingest.rs:430-441</code> ; 15 <code>CLOSE-WAIT</code> mesurés, 0 après redémarrage</td></tr>
+      <tr><td><span class="tag t-crit">Critique</span></td><td><b>SSRF via <code>/v2/cmd</code></b> : <code>is_forbidden_host</code> n'est pas appliqué ; <code>extract_host</code> naïf (userinfo, IP décimales/hex, nip.io).</td><td><code>api.rs:295-311</code>, <code>api.rs:767-784</code> ; <code>/v2/goto</code> 403 vs <code>/v2/cmd goto</code> passe</td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b><code>record/start</code> exécute un <code>python</code>/<code>script</code> arbitraire</b> ; <code>stop</code> sans timeout ; stdout/stderr non drainés → blocage du script.</td><td><code>record.rs:127-128</code>, <code>153-154</code>, <code>188</code></td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b>Fuite de listeners <code>chrome.alarms.onAlarm</code></b> : un handler ajouté à chaque reconnexion.</td><td><code>background.js:133</code>, appelé depuis <code>connect()</code></td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b><code>tabs_create</code> réutilise sans naviguer</b> : query/hash ignorés, pas de <code>update({url})</code> → le démon pilote une autre page.</td><td><code>background.js:425-440</code>, <code>476-480</code></td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b>Humanisation inversée</b> : Bézier/typos réservés aux gestes JS <code>isTrusted=false</code> ; les gestes CDP natifs sont linéaires, sans typos.</td><td><code>humanize-math.js</code> branché sur <code>click</code>/<code>fill</code> JS ; <code>background.js:771-782</code>, <code>845-855</code></td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b>Iframes et shadow DOM inaccessibles</b> : aucun <code>allFrames</code> ; captchas détectés mais inclicables.</td><td><code>background.js</code> (0 occurrence de <code>allFrames</code>)</td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b>Timeout 25 s sans annulation</b> : la commande continue en arrière-plan après la réponse d'erreur, risque de double exécution.</td><td><code>background.js:334-342</code></td></tr>
+      <tr><td><span class="tag t-high">Élevé</span></td><td><b>MCP non configuré et trompeur</b> : <code>dsh_ping</code> dit OK extension morte ; <code>dsh_read</code> ne fait pas d'outline ; <code>dsh_wait</code> schéma faux ; <code>dsh_events</code> ignore <code>limit</code> ; screenshot mime faux.</td><td><code>server.js:53,84,148</code> ; tests <code>tools/call</code></td></tr>
+      <tr><td><span class="tag t-mid">Moyen</span></td><td><b>Secrets en clair</b> : <code>/v2/fill</code> journalise <code>value</code> dans <code>actions.jsonl</code> (mots de passe).</td><td><code>api.rs:299</code>, <code>533</code></td></tr>
+      <tr><td><span class="tag t-mid">Moyen</span></td><td><b>Pas de handshake de version</b> : démon 1.0.0 et extension 1.0.2 peuvent diverger silencieusement ; le message <code>hello</code> documenté n'existe pas.</td><td><code>channel.rs:14</code> vs <code>ingest.rs</code></td></tr>
+      <tr><td><span class="tag t-mid">Moyen</span></td><td><b>Mapping déconnexion incohérent</b> : 502 <code>extension_disconnected</code> brut au lieu du 504 documenté.</td><td><code>api.rs:153</code> vs <code>channel.rs:339</code></td></tr>
+      <tr><td><span class="tag t-mid">Moyen</span></td><td><b>Logs non bornés</b> : <code>events.jsonl</code> 56 Mo, aucune rotation ; connexions WS loguées en <code>debug</code> seulement.</td><td><code>~/.dsh-eyes/events.jsonl</code></td></tr>
+      <tr><td><span class="tag t-mid">Moyen</span></td><td><b>Concurrence et verrou</b> : clé <code>"global"</code> quand <code>tab_id</code> est implicite → <code>click</code> JS et <code>click_native</code> peuvent s'attacher au même onglet en parallèle.</td><td><code>background.js:331</code>, <code>1053</code></td></tr>
+      <tr><td><span class="tag t-low">Faible</span></td><td><b>Documentation obsolète</b> : <code>extension/README.md</code> nie <code>tabs</code>/<code>debugger</code>/<code>eval</code> ; README principal faux sur <code>wait</code> et muet sur <code>focus</code>/<code>direct</code>.</td><td><code>extension/README.md:86-87</code> ; <code>README.fr.md:55-73</code></td></tr>
+      <tr><td><span class="tag t-low">Faible</span></td><td><b>Tests qui fuient</b> : <code>std::mem::forget(server)</code> dans 4 fichiers ; <code>record</code> et <code>hands</code> non testés.</td><td><code>tests/cmd.rs:93</code>, <code>endpoints.rs:95</code>, <code>actions.rs:118</code>, <code>captcha.rs:103</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>5. M2M ou navigation humaine : deux modes, un même moteur</h2>
+  <table>
+    <thead><tr><th>Exigence</th><th>M2M déterministe</th><th>Navigation humaine</th></tr></thead>
+    <tbody>
+      <tr><td>Objectif</td><td>Exécuter une séquence reproductible, vérifiable, idempotente</td><td>Se comporter comme un opérateur : trajectoires, pauses, lecture, hésitation</td></tr>
+      <tr><td>Primitives</td><td><code>goto</code>, <code>read</code>, <code>find</code>, <code>click_native</code>, <code>type_native</code>, <code>wait_for</code></td><td>Mêmes primitives + profil de mouvement, pauses, scroll, focus</td></tr>
+      <tr><td>Preuve</td><td><code>verified</code>, code HTTP, capture, diff DOM stable</td><td>Vidéo, trace d'actions, signaux d'activité</td></tr>
+      <tr><td>Faiblesse actuelle</td><td>Pas de batch, pas d'idempotence, pas d'annulation, cibles mono-frame</td><td>Humanisation branchée sur le mauvais chemin (JS détectable)</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>Constat central.</b> Le mode qui se veut humain (gestes CDP <code>isTrusted=true</code>) est aujourd'hui le moins humain : trajectoire linéaire 3-8 points, bruit ±1 px, frappe sans typos. Le mode qui est le plus humain (Bézier, typos, délais lognormaux) produit des événements <code>isTrusted=false</code>, immédiatement identifiables. Il faut inverser ce branchement.</div>
+
+  <h2>6. Plan d'amélioration</h2>
+
+  <div class="phase"><b>Phase 0 — Quick wins (1 à 2 jours).</b> Rendre le socle sûr et crédible avant d'ajouter des fonctions.
+    <ul>
+      <li>Authentifier <code>/ws</code> (token + Origin + handshake <code>hello</code>), refuser un second client ou remplacer proprement l'ancien.</li>
+      <li>Corriger le deadlock de fermeture WS et ajouter un timeout/limite de connexions (fin des <code>CLOSE-WAIT</code>).</li>
+      <li>Centraliser <code>is_forbidden_host</code> sur <b>toutes</b> les routes, y compris <code>/v2/cmd</code>, avec parsing d'URL robuste et résolution DNS.</li>
+      <li>Corriger <code>tabs_create</code> (naviguer l'onglet réutilisé) et la fuite <code>onAlarm</code>.</li>
+      <li>Corriger les 5 bugs MCP (ping réel, read outline, wait, events limit, mime screenshot).</li>
+      <li>Brancher <code>humanize-math.js</code> sur les gestes CDP natifs.</li>
+      <li>Rotation des logs, <code>GET /v2/info</code> (versions démon + extension + capabilities).</li>
+    </ul>
+  </div>
+
+  <div class="phase"><b>Phase 1 — Socle fiable (1 semaine).</b> Un canal identifié, reprenable et observable.
+    <ul>
+      <li>Session unique avec <code>session_id</code>, heartbeat <code>ping/pong</code> applicatif, reconnexion automatique de l'extension après perte du sink.</li>
+      <li>Idempotence : <code>action_id</code> + cache de résultat côté extension ; le démon peut réessayer sans double clic.</li>
+      <li>Annulation réelle : <code>cancel</code> par <code>cmd_id</code>, le geste s'arrête à l'expiration.</li>
+      <li>File par onglet côté démon et verrou global <code>chrome.debugger</code>.</li>
+      <li>Tests de déconnexion en cours de requête, de double exécution et de saturation.</li>
+    </ul>
+  </div>
+
+  <div class="phase"><b>Phase 2 — Moteur d'actions (1 à 2 semaines).</b> Le vrai gain M2M.
+    <ul>
+      <li>Commande <code>act</code> batch : une liste d'étapes (goto, wait_for, click, type, scroll, extract) exécutée côté extension avec un seul timeout et un journal.</li>
+      <li>Modèle de cible unifié : <code>{tab_id, frame_id, selector | text | role/name | rect}</code>, résolution multi-frame (<code>allFrames</code>) et shadow DOM.</li>
+      <li>Vérification d'effet stable : MutationObserver + réseau idle, retour <code>{changed, evidence, before/after}</code>.</li>
+      <li>Outils MCP : <code>dsh_act</code>, <code>dsh_extract</code>, <code>dsh_tabs</code>, <code>dsh_info</code>, <code>dsh_ping</code> réel.</li>
+      <li>Commandes manquantes : <code>tabs_list</code>, <code>tabs_close</code>, <code>window_create</code>, <code>window_focus</code>, gestion des onglets épinglés et des dialogues <code>alert/confirm/prompt</code>.</li>
+    </ul>
+  </div>
+
+  <div class="phase"><b>Phase 3 — Navigation humaine (1 semaine).</b> Le mode « comme un humain ».
+    <ul>
+      <li>Profils <code>human_profile</code> (calme / normal / pressé) avec seed reproductible pour les tests.</li>
+      <li>Trajectoires Bézier avec overshoot, bruit, pauses, vitesse variable ; frappe avec typos, backspaces, dwell lognormal, pauses de réflexion.</li>
+      <li>Mouvements périphériques entre actions, pauses de lecture proportionnelles au texte, scroll par blocs, focus/blur.</li>
+      <li>Apprentissage par démonstration : enregistrer les gestes d'Eddie et les rejouer avec variation.</li>
+      <li>Mode co-pilote : overlay de proposition d'action, validation humaine avant exécution sur les opérations sensibles.</li>
+    </ul>
+  </div>
+
+  <div class="phase"><b>Phase 4 — Observabilité et sûreté (1 semaine).</b>
+    <ul>
+      <li>Métriques : latence, taux d'échec, commandes par onglet, reconnexions, sockets ouvertes.</li>
+      <li>Journal d'audit avec <code>action_id</code>, <code>params</code> <b>redacted</b> (jamais les valeurs de <code>fill</code>), durée et <code>verified</code>.</li>
+      <li>Rate limit par commande/onglet, allowlist par domaine et par commande, confirmation humaine pour <code>eval</code> et <code>record/start</code>.</li>
+      <li>Rotation et compression des JSONL, tableau de bord HTML temps réel.</li>
+    </ul>
+  </div>
+
+  <div class="phase"><b>Phase 5 — Déploiement et tests (1 semaine).</b>
+    <ul>
+      <li>Source de vérité unique : un script <code>deploy-extension.sh</code> copie la version taguée vers <code>dsh-eyes-extension-current</code> ; plus de noms de dossiers trompeurs.</li>
+      <li>Handshake de version obligatoire ; <code>GET /v2/info</code> expose les versions et capacités.</li>
+      <li>CI GitHub Actions : <code>cargo test</code>, <code>cargo clippy -D warnings</code>, tests Node, build musl, zip et release.</li>
+      <li>E2E Chrome headless avec extension chargée : goto/read/click/fill/screenshot, reconnexion, double exécution, SSRF.</li>
+      <li>Tags <code>v1.0.2</code>, <code>v1.1.0</code> et synchronisation Forgejo.</li>
+    </ul>
+  </div>
+
+  <h2>7. Innovations différenciantes</h2>
+  <ul>
+    <li><b>Co-pilote humain</b> : l'agent propose une action surlignée dans la page ; l'humain valide ou corrige. Le meilleur des deux modes pour les consoles sensibles (GA4, GSC, Bing).</li>
+    <li><b>Learning from demonstration</b> : enregistrer les gestes réels d'Eddie (souris, clavier, scroll) et les rejouer avec variation contrôlée. Le profil humain n'est plus inventé, il est appris.</li>
+    <li><b>Trust score par action</b> : le démon note chaque action (sélecteur stable, effet vérifié, absence de captcha, domaine autorisé) et escalade vers l'humain sous un seuil.</li>
+    <li><b>Session recorder synchronisé</b> : vidéo MP4 + trace JSONL des actions, alignées sur la même timeline — preuve exploitable pour un audit.</li>
+    <li><b>Multi-persona</b> : profils « lecture », « achat », « admin » avec des paramètres de mouvement, de pause et de scroll différents.</li>
+  </ul>
+
+  <h2>8. Preuves et état runtime</h2>
+  <ul>
+    <li><code>GET /health</code> → <code>{"ok":true,"version":"1.0.0"}</code> ; <code>/v2/ping</code> → 200 en ~20 ms.</li>
+    <li><code>tabs_create</code> example.com → 200 en 0,87 s ; <code>read mode:outline</code> → 200 en 8 ms.</li>
+    <li>Avant redémarrage : 15 sockets <code>CLOSE-WAIT</code> sur 8445. Après redémarrage : 0, une seule ESTAB.</li>
+    <li>Extension chargée : <code>Profile 16</code>, chemin <code>Downloads\dsh-eyes-extension-1.0.0</code>, manifest 1.0.2, <code>background.js</code> identique à la source (diff vide).</li>
+    <li>Le test WS de l'audit a cassé le canal (504) ; le redémarrage du service l'a rétabli — preuve directe du bug « dernière connexion gagne ».</li>
+  </ul>
+
+  <h2>9. Verdict</h2>
+  <p><b>Statut réel :</b> prototype avancé et fonctionnel localement, pas encore fiable pour un pilotage M2M autonome. <b>Portée réelle :</b> Chrome personnel d'Eddie, extension 1.0.2 chargée, démon 1.0.0 actif, MCP prêt mais non branché. <b>Priorité :</b> consolider le transport et la sécurité (phases 0-1) avant d'ajouter des commandes ou de l'humanisation. <b>Prochaine étape recommandée :</b> traiter les cinq quick wins de la phase 0, puis mesurer la stabilité sur 24 h (zéro <code>CLOSE-WAIT</code>, zéro 504 non expliqué).</p>
+
+  <footer>
+    Audit réalisé le 21 octobre 2026 · sources : code Rust, extension MV3, serveur MCP, runtime local, dépôt <code>ploteddie-bit/dsh-eyes</code> (HEAD <code>7fe4a38</code>) · aucun fichier du projet modifié pendant l'audit.
+  </footer>
+</main>
+</body>
+</html>

@@ -461,19 +461,48 @@ fn is_private_rfc1918(ip: &IpAddr) -> bool {
 /// c'est le rôle du vigil de notifier `new_domain`. Cette fonction ne
 /// vise que les cibles manifestement privées.
 pub fn is_forbidden_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
         return true;
     }
     // Normalise IPv4-mapped IPv6 (::ffff:127.0.0.1 → 127.0.0.1) avant le
     // parse, sinon la forme mappée échappe aux règles loopback/RFC1918.
-    let normalized = host
+    let normalized = h
         .strip_prefix("::ffff:")
         .map(|s| s.to_string())
-        .unwrap_or_else(|| host.to_string());
+        .unwrap_or_else(|| h.clone());
     if let Ok(ip) = normalized.parse::<IpAddr>() {
-        return is_loopback(&ip) || is_private_rfc1918(&ip);
+        return is_forbidden_ip(&ip);
     }
     false
+}
+
+/// `true` si l'IP appartient à une plage non routable ou sensible :
+/// loopback, RFC1918, link-local, unspecified, multicast, ULA IPv6.
+/// Brique commune à `is_forbidden_host` et à la validation des URLs
+/// côté API (y compris les adresses résolues par DNS).
+pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
+    if is_loopback(ip) || is_private_rfc1918(ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_forbidden_ip(&IpAddr::V4(v4)))
+                    .unwrap_or(false)
+        }
+    }
 }
 
 /// Calcule le chemin de `allowlist.json` (même logique que `events.jsonl` —

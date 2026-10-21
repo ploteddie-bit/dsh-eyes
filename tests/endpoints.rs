@@ -138,6 +138,7 @@ fn parse_status(raw: &str) -> u16 {
 /// Ouvre la fausse extension et attend son enregistrement côté serveur.
 async fn open_fake_extension(
     addr: std::net::SocketAddr,
+    token: &str,
     channel: &ExtensionChannel,
 ) -> (
     futures_util::stream::SplitStream<
@@ -148,7 +149,7 @@ async fn open_fake_extension(
         Message,
     >,
 ) {
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");
@@ -275,7 +276,7 @@ async fn open_403_ip_privee_rfc1918() {
 #[tokio::test]
 async fn open_200_avec_fausse_extension() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -325,7 +326,7 @@ async fn open_504_sans_extension() {
 #[tokio::test]
 async fn open_502_extension_renvoie_erreur() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -407,7 +408,7 @@ async fn read_400_tab_id_manquant() {
 #[tokio::test]
 async fn read_200_avec_fausse_extension() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -460,7 +461,7 @@ async fn read_504_sans_extension() {
 #[tokio::test]
 async fn read_502_extension_renvoie_erreur() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -495,7 +496,7 @@ async fn read_502_extension_renvoie_erreur() {
 #[tokio::test]
 async fn open_journalise_dans_actions_jsonl() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {

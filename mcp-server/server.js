@@ -17,6 +17,8 @@ const BASE = process.env.DSH_URL || "http://127.0.0.1:8445";
 const TOKEN = process.env.DSH_TOKEN ||
   fs.readFileSync(path.join(os.homedir(), ".dsh-eyes", "token"), "utf8").trim();
 
+const TIMEOUT_MS = 35000;
+
 async function appel(methode, chemin, corps) {
   const rep = await fetch(BASE + chemin, {
     method: methode,
@@ -25,6 +27,7 @@ async function appel(methode, chemin, corps) {
       "Content-Type": "application/json",
     },
     body: corps ? JSON.stringify(corps) : undefined,
+    signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   const texte = await rep.text();
   return { status: rep.status, texte };
@@ -45,12 +48,14 @@ async function appelJson(methode, chemin, corps) {
 
 const AVERTISSEMENT = "Exécuté dans le Chrome PERSONNEL d'Eddie. Ne JAMAIS taper un identifiant/mot de passe/captcha à sa place — demander à Eddie. Stop immédiat si détection anti-bot.";
 
-const serveur = new McpServer({ name: "dsh-eyes", version: "1.0.0" });
+const serveur = new McpServer({ name: "dsh-eyes", version: "1.1.0" });
 
 serveur.registerTool(
   "dsh_ping",
-  { description: "Santé du harnais dsh-eyes (démon + réponse extension)." },
-  async () => ({ content: [{ type: "text", text: texteOuErreur(await appel("GET", "/v2/ping")) }] })
+  { description: "Santé du harnais dsh-eyes : version du démon et état réel de l'extension (connectée, version, capacités)." },
+  async () => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("GET", "/v2/info")) }],
+  })
 );
 
 serveur.registerTool(
@@ -78,26 +83,37 @@ serveur.registerTool(
 serveur.registerTool(
   "dsh_read",
   {
-    description: "Lit un onglet (outline accessibilité : titres, liens, boutons, champs) — pour décider la prochaine action.",
-    inputSchema: { tab_id: z.number().describe("Identifiant de l'onglet (renvoyé par dsh_open)") },
+    description: "Lit un onglet : `text` (innerText) ou `outline` (éléments interactifs avec géométrie) — pour décider la prochaine action.",
+    inputSchema: {
+      tab_id: z.number().describe("Identifiant de l'onglet (renvoyé par dsh_open)"),
+      mode: z.enum(["text", "outline"]).optional().describe("text (défaut) ou outline"),
+    },
   },
-  async ({ tab_id }) => ({
-    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/read", { tab_id })) }],
+  async ({ tab_id, mode }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/cmd", { cmd: "read", params: { tab_id, mode } })) }],
   })
 );
 
 serveur.registerTool(
   "dsh_click",
   {
-    description: "Clic natif vérifié sur un sélecteur CSS de l'onglet. " + AVERTISSEMENT,
+    description: "Clic sur un sélecteur CSS. `native:true` utilise CDP (isTrusted=true, trajectoire humaine) ; sinon clic JS détectable. " + AVERTISSEMENT,
     inputSchema: {
       tab_id: z.number(),
       selector: z.string().describe("Sélecteur CSS"),
+      native: z.boolean().optional().describe("true = clic natif CDP (recommandé), false = clic JS"),
     },
   },
-  async ({ tab_id, selector }) => ({
-    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/click", { tab_id, selector })) }],
-  })
+  async ({ tab_id, selector, native }) => {
+    if (native) {
+      return {
+        content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/cmd", { cmd: "click_native", params: { tab_id, selector } })) }],
+      };
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/click", { tab_id, selector })) }],
+    };
+  }
 );
 
 serveur.registerTool(
@@ -118,10 +134,10 @@ serveur.registerTool(
 serveur.registerTool(
   "dsh_wait",
   {
-    description: "Attend qu'un sélecteur apparaisse dans l'onglet (timeout_ms par défaut côté démon).",
+    description: "Attend qu'un sélecteur apparaisse dans l'onglet (timeout_ms par défaut côté démon, plafonné à 10 s).",
     inputSchema: {
       tab_id: z.number(),
-      selector: z.string().optional(),
+      selector: z.string().describe("Sélecteur CSS à attendre"),
       timeout_ms: z.number().optional(),
     },
   },
@@ -136,16 +152,17 @@ serveur.registerTool(
     description: "Capture d'écran de l'onglet (image retournée).",
     inputSchema: {
       tab_id: z.number(),
-      format: z.string().optional().describe("png (défaut) ou jpeg"),
+      format: z.enum(["png", "jpeg"]).optional().describe("png (défaut) ou jpeg"),
     },
   },
   async ({ tab_id, format }) => {
     const r = await appelJson("POST", "/v2/page/screenshot", { tab_id, format });
     const b64 = r.image || r.b64;
     if (b64) {
+      const mime = (r.format || format) === "jpeg" ? "image/jpeg" : "image/png";
       return {
         content: [
-          { type: "image", data: b64, mimeType: r.mime_type || "image/jpeg" },
+          { type: "image", data: b64, mimeType: mime },
           { type: "text", text: "Capture de l'onglet " + tab_id },
         ],
       };

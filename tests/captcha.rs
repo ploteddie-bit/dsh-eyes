@@ -144,6 +144,7 @@ fn parse_status(raw: &str) -> u16 {
 
 async fn open_fake_extension(
     addr: std::net::SocketAddr,
+    token: &str,
     channel: &ExtensionChannel,
 ) -> (
     futures_util::stream::SplitStream<
@@ -154,7 +155,7 @@ async fn open_fake_extension(
         Message,
     >,
 ) {
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");
@@ -222,7 +223,7 @@ async fn screenshot_400_format_invalide() {
 #[tokio::test]
 async fn screenshot_200_avec_fausse_extension() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -268,7 +269,7 @@ async fn screenshot_200_sans_format() {
     // Pas de `format` dans la requête : le serveur doit accepter (défaut
     // côté extension = "png") et le `b64` doit être extrait.
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -320,7 +321,7 @@ async fn screenshot_504_sans_extension() {
 #[tokio::test]
 async fn screenshot_502_extension_renvoie_erreur() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -357,7 +358,7 @@ async fn screenshot_502_data_url_manquant() {
     // L'extension renvoie ok=true mais sans data_url (forme inattendue).
     // On s'attend à une 502 dédiée, pas une 200 avec b64=null.
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -399,7 +400,7 @@ async fn captcha_401_sans_token() {
 #[tokio::test]
 async fn captcha_200_aucun_detecte() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -440,7 +441,7 @@ async fn captcha_200_aucun_detecte() {
 #[tokio::test]
 async fn captcha_200_recaptcha_v2_image_detecte() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -486,7 +487,7 @@ async fn captcha_200_recaptcha_v2_image_detecte() {
 async fn captcha_200_recaptcha_v2_invisible() {
     // Type différent : reCAPTCHA invisible (pas d'image_b64 attendu).
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {
@@ -541,7 +542,7 @@ async fn captcha_504_sans_extension() {
 #[tokio::test]
 async fn captcha_502_extension_renvoie_erreur() {
     let (token, addr, channel) = start_server_with_token().await;
-    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &channel).await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
 
     let token2 = token.clone();
     let post_task = tokio::spawn(async move {

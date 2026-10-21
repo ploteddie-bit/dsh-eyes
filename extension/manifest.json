@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "DSH Eyes",
-  "version": "1.0.2",
-  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH. 1.0.0 : première version majeure — file d'attente par onglet, eval timeout_ms paramétrable, read mode outline + commande find, fill mode direct, accusé vérifié des clics natifs (verified), enregistrement d'écran piloté par le démon (/v2/record/*).",
+  "version": "1.1.0",
+  "description": "Vigil de navigation + mains du navigateur pour le harnais DSH. 1.1.0 : auth WS + handshake, humanisation CDP — file d'attente par onglet, eval timeout_ms paramétrable, read mode outline + commande find, fill mode direct, accusé vérifié des clics natifs (verified), enregistrement d'écran piloté par le démon (/v2/record/*).",
   "permissions": ["webRequest", "storage", "scripting", "tabs", "alarms", "tabGroups", "debugger"],
   "host_permissions": ["<all_urls>"],
+  "options_ui": { "page": "options.html", "open_in_tab": true },
   "background": { "service_worker": "background.js", "type": "module" }
 }

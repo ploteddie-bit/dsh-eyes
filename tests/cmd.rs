@@ -140,7 +140,7 @@ async fn cmd_succes_via_fausse_extension() {
     let (token, addr, channel) = start_server_with_token().await;
 
     // 1) Ouvre la WS en tant que fausse extension.
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");
@@ -248,7 +248,7 @@ async fn cmd_502_extension_renvoie_erreur() {
     let (token, addr, _channel) = start_server_with_token().await;
 
     // 1) Ouvre la WS.
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");
@@ -294,7 +294,7 @@ async fn cmd_502_extension_renvoie_erreur() {
 async fn cmd_plusieurs_requetes_en_parallele() {
     let (token, addr, _channel) = start_server_with_token().await;
 
-    let url = format!("ws://{addr}/ws");
+    let url = format!("ws://{addr}/ws?token={token}");
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS connect");

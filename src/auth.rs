@@ -99,7 +99,7 @@ fn extract_bearer(request: &Request) -> Option<String> {
 /// le nombre d'opérations ne dépend pas du contenu. La longueur est
 /// testée à part (court-circuit en temps constant ici n'a pas de sens car
 /// les longueurs attendues sont fixées par construction — 64 hex chars).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
