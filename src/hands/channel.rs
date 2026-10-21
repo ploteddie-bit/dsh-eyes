@@ -39,8 +39,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,6 +135,108 @@ impl SinkHandle {
     }
 }
 
+/// Compteurs par commande (atomics : pas de verrou sur le chemin chaud).
+#[derive(Default)]
+struct CommandStats {
+    total: AtomicU64,
+    ok: AtomicU64,
+    error: AtomicU64,
+    timeout: AtomicU64,
+    total_ms: AtomicU64,
+}
+
+/// Issue d'une commande pour les métriques.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Ok,
+    Error,
+    Timeout,
+    NoExtension,
+}
+
+/// Métriques process-wide du canal extension : volumes, issues, latence.
+#[derive(Default)]
+struct Metrics {
+    total: AtomicU64,
+    ok: AtomicU64,
+    error: AtomicU64,
+    timeout: AtomicU64,
+    no_extension: AtomicU64,
+    in_flight: AtomicU64,
+    total_ms: AtomicU64,
+    per_command: StdMutex<HashMap<String, Arc<CommandStats>>>,
+}
+
+impl Metrics {
+    fn start(&self, cmd: &str) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.stats_for(cmd).total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish(&self, cmd: &str, outcome: Outcome, elapsed: Duration) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let ms = elapsed.as_millis() as u64;
+        self.total_ms.fetch_add(ms, Ordering::Relaxed);
+        let stats = self.stats_for(cmd);
+        stats.total_ms.fetch_add(ms, Ordering::Relaxed);
+        match outcome {
+            Outcome::Ok => {
+                self.ok.fetch_add(1, Ordering::Relaxed);
+                stats.ok.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::Error => {
+                self.error.fetch_add(1, Ordering::Relaxed);
+                stats.error.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::Timeout => {
+                self.timeout.fetch_add(1, Ordering::Relaxed);
+                stats.timeout.fetch_add(1, Ordering::Relaxed);
+            }
+            Outcome::NoExtension => {
+                self.no_extension.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn stats_for(&self, cmd: &str) -> Arc<CommandStats> {
+        let mut map = self.per_command.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(cmd.to_string())
+            .or_insert_with(|| Arc::new(CommandStats::default()))
+            .clone()
+    }
+
+    fn snapshot(&self) -> Value {
+        let mut per_command = serde_json::Map::new();
+        let map = self.per_command.lock().unwrap_or_else(|e| e.into_inner());
+        for (cmd, s) in map.iter() {
+            per_command.insert(
+                cmd.clone(),
+                serde_json::json!({
+                    "total": s.total.load(Ordering::Relaxed),
+                    "ok": s.ok.load(Ordering::Relaxed),
+                    "error": s.error.load(Ordering::Relaxed),
+                    "timeout": s.timeout.load(Ordering::Relaxed),
+                    "total_ms": s.total_ms.load(Ordering::Relaxed),
+                }),
+            );
+        }
+        serde_json::json!({
+            "ok": true,
+            "commands": {
+                "total": self.total.load(Ordering::Relaxed),
+                "ok": self.ok.load(Ordering::Relaxed),
+                "error": self.error.load(Ordering::Relaxed),
+                "timeout": self.timeout.load(Ordering::Relaxed),
+                "no_extension": self.no_extension.load(Ordering::Relaxed),
+                "in_flight": self.in_flight.load(Ordering::Relaxed),
+                "total_ms": self.total_ms.load(Ordering::Relaxed),
+                "per_command": per_command,
+            }
+        })
+    }
+}
+
 /// État partagé entre la boucle WS (`ingest::handle_socket`) et le
 /// routeur HTTP v2 (`api::v2_cmd`).
 ///
@@ -162,6 +265,8 @@ struct Inner {
     /// existait déjà côté extension, elle est désormais aussi dans le
     /// démon). Les commandes sans `tab_id` restent concurrentes.
     tab_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    /// Compteurs d'observabilité (volumes, issues, latence).
+    metrics: Metrics,
 }
 
 /// Timeout par défaut d'attente de réponse d'une commande.
@@ -202,6 +307,7 @@ impl ExtensionChannel {
                 next_id: AtomicU64::new(0),
                 hello: Mutex::new(None),
                 tab_locks: Mutex::new(HashMap::new()),
+                metrics: Metrics::default(),
             }),
         }
     }
@@ -257,6 +363,12 @@ impl ExtensionChannel {
         self.inner.hello.lock().await.clone()
     }
 
+    /// Snapshot JSON des métriques du canal (volumes, issues, latence
+    /// globale et par commande).
+    pub fn metrics_snapshot(&self) -> Value {
+        self.inner.metrics.snapshot()
+    }
+
     /// Retourne le verrou associé à un `tab_id` explicite. La map grandit
     /// d'une entrée par onglet réellement utilisé ; le nombre d'onglets
     /// est borné par l'usage. Les commandes sans `tab_id` n'utilisent
@@ -296,6 +408,26 @@ impl ExtensionChannel {
         params: Value,
         timeout: Duration,
     ) -> CommandResult {
+        let cmd = cmd.into();
+        self.inner.metrics.start(&cmd);
+        let started = Instant::now();
+        let result = self.send_command_locked(cmd.clone(), params, timeout).await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Ok,
+            Err(CommandError::NoExtension) => Outcome::NoExtension,
+            Err(CommandError::Timeout(_)) => Outcome::Timeout,
+            Err(CommandError::ChannelClosed | CommandError::ExtensionError(_)) => Outcome::Error,
+        };
+        self.inner.metrics.finish(&cmd, outcome, started.elapsed());
+        result
+    }
+
+    async fn send_command_locked(
+        &self,
+        cmd: String,
+        params: Value,
+        timeout: Duration,
+    ) -> CommandResult {
         // Sérialisation par onglet quand `tab_id` est explicite. Le
         // verrou est tenu pendant tout l'aller-retour (push + attente).
         let tab_lock = match params.get("tab_id").and_then(|v| v.as_i64()) {
@@ -307,7 +439,6 @@ impl ExtensionChannel {
             None => None,
         };
         let cmd_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let cmd = cmd.into();
         let command = Command { cmd_id, cmd, params };
 
         let (tx, rx) = oneshot::channel();
@@ -802,5 +933,44 @@ mod tests {
         .await;
         let _ = h1.await.expect("join 1").expect("réponse 1");
         let _ = h2.await.expect("join 2").expect("réponse 2");
+    }
+
+    #[tokio::test]
+    async fn metrics_comptent_ok_et_timeout() {
+        let ch = ExtensionChannel::new();
+        let (sink, mut sink_rx) = make_sink();
+        ch.register(SinkHandle::new(sink)).await;
+
+        let ch2 = ch.clone();
+        let h = tokio::spawn(async move {
+            ch2.send_command_with_timeout(
+                "goto",
+                serde_json::json!({"tab_id": 1}),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let env = sink_rx.recv().await.expect("cmd goto");
+        let id = parse(&env)["cmd_id"].as_u64().expect("cmd_id");
+        ch.dispatch_response(Response {
+            cmd_id: id,
+            ok: true,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })
+        .await;
+        let _ = h.await.expect("join").expect("réponse");
+
+        let _ = ch
+            .send_command_with_timeout("read", serde_json::json!({}), Duration::from_millis(30))
+            .await;
+
+        let snap = ch.metrics_snapshot();
+        assert_eq!(snap["commands"]["total"], 2);
+        assert_eq!(snap["commands"]["ok"], 1);
+        assert_eq!(snap["commands"]["timeout"], 1);
+        assert_eq!(snap["commands"]["in_flight"], 0);
+        assert_eq!(snap["commands"]["per_command"]["goto"]["ok"], 1);
+        assert_eq!(snap["commands"]["per_command"]["read"]["timeout"], 1);
     }
 }

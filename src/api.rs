@@ -82,6 +82,12 @@ async fn v2_info(Extension(channel): Extension<ExtensionChannel>) -> Json<serde_
     }))
 }
 
+/// Handler `GET /v2/metrics` — volumes, issues et latence des commandes
+/// envoyées à l'extension, globalement et par commande.
+async fn v2_metrics(Extension(channel): Extension<ExtensionChannel>) -> Json<serde_json::Value> {
+    Json(channel.metrics_snapshot())
+}
+
 /// Corps de la requête `POST /v2/cmd`. Désérialisé en `Value` côté
 /// `params` pour rester agnostique du contenu (le démon ne valide pas
 /// la forme des params — c'est l'affaire de l'extension).
@@ -878,6 +884,7 @@ fn v2_router(
     Router::new()
         .route("/ping", get(v2_ping))
         .route("/info", get(v2_info))
+        .route("/metrics", get(v2_metrics))
         .route("/cmd", post(v2_cmd))
         .route("/open", post(v2_open))
         .route("/read", post(v2_read))
