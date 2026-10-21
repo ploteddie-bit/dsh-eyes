@@ -164,6 +164,7 @@ async function connect() {
             "click_native", "click_native_text", "click_native_rect",
             "type_native", "scroll_native", "screen_pos",
             "screenshot", "captcha_detect", "record",
+            "multiframe", "shadow_dom",
           ],
         },
       }));
@@ -597,9 +598,27 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
         if (name) return el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]';
         return el.tagName.toLowerCase();
       };
+      // Auto-contenu : cette fonction est sérialisée dans chaque frame.
+      const deepAll = (sel) => {
+        const out = [];
+        const vus = new Set();
+        const walk = (root) => {
+          if (!root || !root.querySelectorAll) return;
+          let matches = [];
+          try { matches = root.querySelectorAll(sel); } catch (_) { return; }
+          for (const el of matches) {
+            if (!vus.has(el)) { vus.add(el); out.push(el); }
+          }
+          for (const el of root.querySelectorAll("*")) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+          }
+        };
+        walk(document);
+        return out;
+      };
       const out = [];
       const vus = new Set();
-      document.querySelectorAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab],[contenteditable=true]").forEach((el) => {
+      deepAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab],[contenteditable=true]").forEach((el) => {
         if (vus.has(el)) return;
         const r = el.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) return;
@@ -617,11 +636,22 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
       });
       return out.slice(0, 250);
     };
-    const [res] = await chrome.scripting.executeScript({
+    const results = await chrome.scripting.executeScript({
       target: { tabId: tab_id },
+      allFrames: true,
       func: injection,
     });
-    return { mode: "outline", elements: res ? res.result : [] };
+    const elements = [];
+    for (const res of results || []) {
+      if (!res || !Array.isArray(res.result)) continue;
+      const frame_id = typeof res.frameId === "number" ? res.frameId : 0;
+      for (const el of res.result) {
+        elements.push({ ...el, frame_id });
+        if (elements.length >= 250) break;
+      }
+      if (elements.length >= 250) break;
+    }
+    return { mode: "outline", elements, frames: (results || []).length };
   }
   const cap = Number.isFinite(max_bytes) ? max_bytes : READ_MAX_BYTES_DEFAULT;
   const injection = (cap) => {
@@ -631,17 +661,21 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
   };
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab_id },
+    allFrames: true,
     func: injection,
     args: [cap],
   });
   if (!Array.isArray(results) || results.length === 0) {
     throw new Error("read: executeScript n'a rien renvoyé");
   }
-  const text = results[0].result;
-  if (typeof text !== "string") {
-    throw new Error("read: résultat non-string");
+  const parts = results
+    .map((r) => (r && typeof r.result === "string" ? r.result : ""))
+    .filter((t) => t.trim().length > 0);
+  let text = parts.join("\n\n");
+  if (text.length > cap) {
+    text = text.slice(0, cap) + "\n[…tronqué à " + cap + " octets]";
   }
-  return { mode: "text", text };
+  return { mode: "text", text, frames: parts.length };
 }
 
 /**
@@ -654,9 +688,23 @@ async function cmdFind({ tab_id, text, selector, limit }) {
   const max = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const injection = (txt, sel, max) => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    // Auto-contenu : sérialisé dans chaque frame.
+    const deepAll = (s) => {
+      const out = [];
+      const vus = new Set();
+      const walk = (root) => {
+        if (!root || !root.querySelectorAll) return;
+        let matches = [];
+        try { matches = root.querySelectorAll(s); } catch (_) { return; }
+        for (const el of matches) if (!vus.has(el)) { vus.add(el); out.push(el); }
+        for (const el of root.querySelectorAll("*")) if (el.shadowRoot) walk(el.shadowRoot);
+      };
+      walk(document);
+      return out;
+    };
     const base = sel
-      ? [...document.querySelectorAll(sel)]
-      : [...document.querySelectorAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab]")];
+      ? deepAll(sel)
+      : deepAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab]");
     const out = [];
     for (const el of base) {
       const r = el.getBoundingClientRect();
@@ -675,13 +723,23 @@ async function cmdFind({ tab_id, text, selector, limit }) {
     }
     return out;
   };
-  const [res] = await chrome.scripting.executeScript({
+  const results = await chrome.scripting.executeScript({
     target: { tabId: id },
+    allFrames: true,
     func: injection,
     args: [typeof text === "string" ? text : "", typeof selector === "string" ? selector : "", max],
   });
-  const elements = res ? res.result : [];
-  return { find: text || selector || "", count: elements.length, elements };
+  const elements = [];
+  for (const res of results || []) {
+    if (!res || !Array.isArray(res.result)) continue;
+    const frame_id = typeof res.frameId === "number" ? res.frameId : 0;
+    for (const el of res.result) {
+      elements.push({ ...el, frame_id });
+      if (elements.length >= max) break;
+    }
+    if (elements.length >= max) break;
+  }
+  return { find: text || selector || "", count: elements.length, elements, frames: (results || []).length };
 }
 
 /**
@@ -840,19 +898,57 @@ async function deplacerCurseur(dbg, tabId, cible) {
   nativeCursor.set(tabId, cible);
 }
 
-/** Lecture seule en JS : géométrie viewport d'un sélecteur. */
+/** Lecture seule en JS : géométrie viewport d'un sélecteur, toutes
+ *  frames et racines shadow ouvertes. Pour une iframe same-origin,
+ *  l'offset de l'iframe est ajouté pour obtenir des coordonnées
+ *  top-level utilisables par Input.dispatchMouseEvent. */
 async function lireRect(id, selector) {
-  const [res] = await chrome.scripting.executeScript({
+  const results = await chrome.scripting.executeScript({
     target: { tabId: id },
+    allFrames: true,
     func: (sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x, y: r.y, w: r.width, h: r.height, visible: r.width > 0 && r.height > 0 };
+      const deepAll = (s) => {
+        const out = [];
+        const vus = new Set();
+        const walk = (root) => {
+          if (!root || !root.querySelectorAll) return;
+          let matches = [];
+          try { matches = root.querySelectorAll(s); } catch (_) { return; }
+          for (const el of matches) if (!vus.has(el)) { vus.add(el); out.push(el); }
+          for (const el of root.querySelectorAll("*")) if (el.shadowRoot) walk(el.shadowRoot);
+        };
+        walk(document);
+        return out;
+      };
+      const frameEl = window.frameElement;
+      const cross = window !== window.top && !frameEl;
+      const ox = frameEl ? frameEl.getBoundingClientRect().left + frameEl.clientLeft : 0;
+      const oy = frameEl ? frameEl.getBoundingClientRect().top + frameEl.clientTop : 0;
+      for (const el of deepAll(sel)) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        return {
+          x: r.x + ox,
+          y: r.y + oy,
+          w: r.width,
+          h: r.height,
+          visible: true,
+          cross_origin: cross,
+          frame_url: location.href,
+        };
+      }
+      return null;
     },
     args: [selector],
   });
-  return res ? res.result : null;
+  let fallback = null;
+  for (const res of results || []) {
+    const rect = res && res.result;
+    if (!rect) continue;
+    if (!rect.cross_origin) return rect;
+    if (!fallback) fallback = rect;
+  }
+  return fallback;
 }
 
 /** Clic natif : trajectoire + hésitation + press/release (isTrusted=true).
@@ -865,6 +961,7 @@ async function cmdClickNative({ tab_id, selector, focus }) {
   const rect = await lireRect(id, selector);
   if (!rect) throw new Error("click_native: sélecteur introuvable: " + selector);
   if (!rect.visible) throw new Error("click_native: élément hors viewport (scroll_native d'abord)");
+  if (rect.cross_origin) throw new Error("click_native: élément dans une iframe cross-origin (non supporté)");
   return clicNatifSurRect(id, rect, selector, focus);
 }
 
@@ -985,26 +1082,60 @@ async function cmdScrollNative({ tab_id, dy }) {
   }, undefined, budget);
 }
 
-/** Trouve un élément PAR TEXTE (lecture seule) et renvoie son rect viewport.
- *  Pont eval→natif : eval SAIT trouver (SPA, Angular), le natif SAIT
- *  cliquer. Aucun geste en JS ici. */
+/** Trouve un élément PAR TEXTE (lecture seule) et renvoie son rect viewport,
+ *  toutes frames et racines shadow ouvertes. Offset d'iframe same-origin
+ *  ajouté pour un clic natif top-level. */
 async function chercherRectTexte(id, texte, exact) {
-  const [res] = await chrome.scripting.executeScript({
+  const results = await chrome.scripting.executeScript({
     target: { tabId: id },
+    allFrames: true,
     func: (txt, ex) => {
       const normaliser = (s) => (s || "").replace(/\s+/g, " ").trim();
-      const cibles = [...document.querySelectorAll("a,button,[role=button],[role=tab],[role=link],input[type=submit],input[type=button]")];
+      const deepAll = (s) => {
+        const out = [];
+        const vus = new Set();
+        const walk = (root) => {
+          if (!root || !root.querySelectorAll) return;
+          let matches = [];
+          try { matches = root.querySelectorAll(s); } catch (_) { return; }
+          for (const el of matches) if (!vus.has(el)) { vus.add(el); out.push(el); }
+          for (const el of root.querySelectorAll("*")) if (el.shadowRoot) walk(el.shadowRoot);
+        };
+        walk(document);
+        return out;
+      };
+      const frameEl = window.frameElement;
+      const cross = window !== window.top && !frameEl;
+      const ox = frameEl ? frameEl.getBoundingClientRect().left + frameEl.clientLeft : 0;
+      const oy = frameEl ? frameEl.getBoundingClientRect().top + frameEl.clientTop : 0;
+      const cibles = deepAll("a,button,[role=button],[role=tab],[role=link],input[type=submit],input[type=button]");
       const el = ex
         ? cibles.find((e) => normaliser(e.textContent) === txt)
         : cibles.find((e) => normaliser(e.textContent).startsWith(txt));
       if (!el) return null;
       const r = el.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return { introuvable: "hors viewport" };
-      return { x: r.x, y: r.y, w: r.width, h: r.height, texte: normaliser(el.textContent).slice(0, 40) };
+      return {
+        x: r.x + ox,
+        y: r.y + oy,
+        w: r.width,
+        h: r.height,
+        texte: normaliser(el.textContent).slice(0, 40),
+        cross_origin: cross,
+        frame_url: location.href,
+      };
     },
     args: [texte, !!exact],
   });
-  return res ? res.result : null;
+  let fallback = null;
+  for (const res of results || []) {
+    const rect = res && res.result;
+    if (!rect) continue;
+    if (rect.introuvable) { if (!fallback) fallback = rect; continue; }
+    if (!rect.cross_origin) return rect;
+    if (!fallback) fallback = rect;
+  }
+  return fallback;
 }
 
 /** Clic natif sur un élément repéré PAR TEXTE (GA4/Angular : pas de
@@ -1015,6 +1146,7 @@ async function cmdClickNativeText({ tab_id, text, exact, focus }) {
   const rect = await chercherRectTexte(id, text, exact);
   if (!rect) throw new Error("click_native_text: aucun élément portant le texte: " + text);
   if (rect.introuvable) throw new Error("click_native_text: élément « " + text + " » hors viewport (scroll_native d'abord)");
+  if (rect.cross_origin) throw new Error("click_native_text: élément dans une iframe cross-origin (non supporté)");
   return clicNatifSurRect(id, rect, JSON.stringify(text), focus);
 }
 
