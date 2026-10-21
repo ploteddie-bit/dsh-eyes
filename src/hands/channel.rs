@@ -157,6 +157,11 @@ struct Inner {
     next_id: AtomicU64,
     /// Dernier `hello` reçu de l'extension (version, client, capacités).
     hello: Mutex<Option<HelloInfo>>,
+    /// Verrous par onglet : deux commandes portant le même `tab_id`
+    /// explicite ne se percutent pas côté démon (la sérialisation
+    /// existait déjà côté extension, elle est désormais aussi dans le
+    /// démon). Les commandes sans `tab_id` restent concurrentes.
+    tab_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
 /// Timeout par défaut d'attente de réponse d'une commande.
@@ -196,6 +201,7 @@ impl ExtensionChannel {
                 pending: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
                 hello: Mutex::new(None),
+                tab_locks: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -251,6 +257,18 @@ impl ExtensionChannel {
         self.inner.hello.lock().await.clone()
     }
 
+    /// Retourne le verrou associé à un `tab_id` explicite. La map grandit
+    /// d'une entrée par onglet réellement utilisé ; le nombre d'onglets
+    /// est borné par l'usage. Les commandes sans `tab_id` n'utilisent
+    /// pas ce verrou et restent concurrentes.
+    async fn tab_lock(&self, tab_id: i64) -> Arc<Mutex<()>> {
+        let mut locks = self.inner.tab_locks.lock().await;
+        locks
+            .entry(tab_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Pousse une commande vers l'extension et attend la réponse, avec
     /// timeout [`DEFAULT_COMMAND_TIMEOUT`].
     ///
@@ -278,6 +296,16 @@ impl ExtensionChannel {
         params: Value,
         timeout: Duration,
     ) -> CommandResult {
+        // Sérialisation par onglet quand `tab_id` est explicite. Le
+        // verrou est tenu pendant tout l'aller-retour (push + attente).
+        let tab_lock = match params.get("tab_id").and_then(|v| v.as_i64()) {
+            Some(id) => Some(self.tab_lock(id).await),
+            None => None,
+        };
+        let _tab_guard = match &tab_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let cmd_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let cmd = cmd.into();
         let command = Command { cmd_id, cmd, params };
@@ -669,5 +697,110 @@ mod tests {
         for h in handles {
             let _ = h.await; // ignore Err(Timeout)
         }
+    }
+
+    #[tokio::test]
+    async fn commandes_meme_onglet_serialisees() {
+        let ch = ExtensionChannel::new();
+        let (sink, mut sink_rx) = make_sink();
+        ch.register(SinkHandle::new(sink)).await;
+
+        let ch1 = ch.clone();
+        let h1 = tokio::spawn(async move {
+            ch1.send_command_with_timeout(
+                "read",
+                serde_json::json!({"tab_id": 7}),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let ch2 = ch.clone();
+        let h2 = tokio::spawn(async move {
+            ch2.send_command_with_timeout(
+                "read",
+                serde_json::json!({"tab_id": 7}),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        // La première commande part ; la seconde est retenue par le verrou.
+        let env1 = sink_rx.recv().await.expect("cmd 1");
+        let id1 = parse(&env1)["cmd_id"].as_u64().expect("cmd_id 1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), sink_rx.recv())
+                .await
+                .is_err(),
+            "la seconde commande du même onglet ne doit pas partir avant la réponse"
+        );
+
+        ch.dispatch_response(Response {
+            cmd_id: id1,
+            ok: true,
+            result: Some(serde_json::json!({"text": "ok"})),
+            error: None,
+        })
+        .await;
+        let _ = h1.await.expect("join 1").expect("réponse 1");
+
+        let env2 = sink_rx.recv().await.expect("cmd 2");
+        let id2 = parse(&env2)["cmd_id"].as_u64().expect("cmd_id 2");
+        ch.dispatch_response(Response {
+            cmd_id: id2,
+            ok: true,
+            result: Some(serde_json::json!({"text": "ok"})),
+            error: None,
+        })
+        .await;
+        let _ = h2.await.expect("join 2").expect("réponse 2");
+    }
+
+    #[tokio::test]
+    async fn commandes_onglets_differents_concurrentes() {
+        let ch = ExtensionChannel::new();
+        let (sink, mut sink_rx) = make_sink();
+        ch.register(SinkHandle::new(sink)).await;
+
+        let ch1 = ch.clone();
+        let h1 = tokio::spawn(async move {
+            ch1.send_command_with_timeout(
+                "read",
+                serde_json::json!({"tab_id": 1}),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let ch2 = ch.clone();
+        let h2 = tokio::spawn(async move {
+            ch2.send_command_with_timeout(
+                "read",
+                serde_json::json!({"tab_id": 2}),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        // Les deux onglets sont différents : les deux commandes partent
+        // sans attendre la réponse de l'autre.
+        let env1 = sink_rx.recv().await.expect("cmd tab 1");
+        let env2 = sink_rx.recv().await.expect("cmd tab 2");
+        let id1 = parse(&env1)["cmd_id"].as_u64().expect("cmd_id 1");
+        let id2 = parse(&env2)["cmd_id"].as_u64().expect("cmd_id 2");
+        ch.dispatch_response(Response {
+            cmd_id: id1,
+            ok: true,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })
+        .await;
+        ch.dispatch_response(Response {
+            cmd_id: id2,
+            ok: true,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })
+        .await;
+        let _ = h1.await.expect("join 1").expect("réponse 1");
+        let _ = h2.await.expect("join 2").expect("réponse 2");
     }
 }
