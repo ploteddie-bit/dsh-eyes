@@ -193,6 +193,44 @@ serveur.registerTool(
   })
 );
 
+serveur.registerTool(
+  "dsh_act",
+  {
+    description: "Exécute un batch séquentiel de 1 à 50 actions avec idempotence optionnelle (`action_id`) : un second appel avec le même id renvoie le cache 5 min. Le `tab_id` produit par tabs_create/goto est propagé aux étapes suivantes. " + AVERTISSEMENT,
+    inputSchema: {
+      action_id: z.string().optional().describe("Identifiant d'idempotence (cache 5 min)"),
+      steps: z.array(z.object({
+        cmd: z.string().describe("Commande : goto, read, click, fill, wait, eval, screenshot, …"),
+        params: z.record(z.any()).optional().describe("Paramètres de la commande"),
+      })).min(1).max(50).describe("Étapes exécutées dans l'ordre"),
+    },
+  },
+  async ({ action_id, steps }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/act", { action_id, steps })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_act_cancel",
+  {
+    description: "Annule un batch `act` en cours : le handler s'arrête avant l'étape suivante et renvoie 409 cancelled avec les résultats partiels.",
+    inputSchema: { action_id: z.string().describe("Identifiant du batch à annuler") },
+  },
+  async ({ action_id }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/act/cancel", { action_id })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_metrics",
+  {
+    description: "Métriques du canal extension : volumes, issues, latence globale et par commande.",
+  },
+  async () => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("GET", "/v2/metrics")) }],
+  })
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await serveur.connect(transport);
