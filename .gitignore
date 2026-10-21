@@ -7,3 +7,8 @@ Cargo.lock.bak
 /extension/node_modules/
 /extension/package-lock.json
 versions/
+
+# Sauvegardes locales et caches
+*.bak.*
+__pycache__/
+*.pyc

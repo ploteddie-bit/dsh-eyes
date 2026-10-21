@@ -789,7 +789,12 @@ fn extract_host(url: &str) -> Option<String> {
 /// modèle vision) est passée en paramètre puis injectée via
 /// `Extension(SolverConfig)` pour que `solve_handler` la lise sans
 /// avoir à recharger `Config` à chaque requête. Cf. [`SolverConfig`].
-fn v2_router(token: String, solver_config: SolverConfig, channel: ExtensionChannel) -> Router {
+fn v2_router(
+    token: String,
+    solver_config: SolverConfig,
+    channel: ExtensionChannel,
+    record: crate::record::RecordState,
+) -> Router {
     Router::new()
         .route("/ping", get(v2_ping))
         .route("/cmd", post(v2_cmd))
@@ -799,6 +804,9 @@ fn v2_router(token: String, solver_config: SolverConfig, channel: ExtensionChann
         .route("/click", post(v2_click))
         .route("/fill", post(v2_fill))
         .route("/wait", post(v2_wait))
+        .route("/record/start", post(crate::record::start))
+        .route("/record/stop", post(crate::record::stop))
+        .route("/record/status", get(crate::record::status))
         .route("/page/screenshot", post(v2_page_screenshot))
         .route("/page/captcha", post(v2_page_captcha))
         .route("/page/group", post(v2_page_group))
@@ -818,6 +826,7 @@ fn v2_router(token: String, solver_config: SolverConfig, channel: ExtensionChann
         .layer(Extension(AuthToken(token)))
         .layer(Extension(solver_config))
         .layer(Extension(channel))
+        .layer(Extension(record))
 }
 
 /// Handler `GET /events` — retourne les N dernières alertes en JSON.
@@ -886,6 +895,7 @@ pub fn router_with_v2(
             // pour que `solve_handler` n'ait plus à recharger la config.
             config.solver_config(),
             channel,
+            crate::record::RecordState::default(),
         ),
     )
 }

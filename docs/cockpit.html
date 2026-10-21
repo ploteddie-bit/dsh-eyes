@@ -95,7 +95,7 @@ header{background:linear-gradient(160deg,#161b22,#0d1117);border:1px solid var(-
 <div class="vue" id="vue-regles"><h2>🧠 Les règles non négociables</h2><div id="regles-liste"></div></div>
 
 <div class="bloc4">
-  <b>Statut réel :</b> <b>déployé — v1 Eyes + v2 Hands/Solveur</b> (05-06/10 nuit) · <b>Portée réelle :</b> v1 = observation (vigil, alertes, stats) ✅ · v2 = manipulation navigateur via extension bidirectionnelle (modèle webbridge : goto/read/click/fill/wait/screenshot/captcha_detect/solve/tab_group) ✅ — e2e réels validés par Eddie : auto-attaque 127.0.0.1 → alerte critical ; pmu.fr ouvert et lu (8 047 caractères, R1 Auteuil C1) ; formulaire httpbin rempli, soumis et vérifié côté serveur (`custname:"Eddie DSH Eyes"`, bacon, large, 18:30) · <b>Preuve :</b> 12 commits (`630fd2be`→`c5af18a`, puis `8d66b20`→HEAD v2 : auth, canal webbridge, endpoints, journalisation, captcha, solveur 2 tiers Ollama, tab_group), 119+ tests verts ×2 runs, clippy vert, binaire musl installé, revue finale « PRÊT POUR PRODUCTION » (v1 : bb8ab957), skill `Edy:~/.dsh/skills/dsh-eyes-agent/SKILL.md` dans le catalogue, rapport `docs/test-e2e-2026-10-05.md` · <b>Prochaine étape :</b> aucune obligatoire — issues upstream DSH rédigées (`Edy:~/.dsh/docs/issues-upstream-dsh-brouillons.md`) ; 6 minors deferred au registre ; limite documentée : application grille/slider captcha en itération future
+  <b>Statut réel :</b> <b>v1.0.0 — version majeure déployée (extension + démon alignés)</b> (21/10) · <b>Portée réelle :</b> extension <code>Edy:~/.dsh-eyes/extension</code> + paquet <code>C:\Users\eddie\Downloads\dsh-eyes-extension-1.0.0</code> (+ zip) ; Chrome charge <code>Downloads\dsh-eyes-extension-0.6.0</code>, mis à jour en 1.0.0 ; démon Rust v1.0.0 (<code>/health</code> le confirme) avec <code>/v2/record/start|stop|status</code> ; CLI <code>bin/rec_ecran_cli.py</code> + venv Windows <code>venv-rec</code> ; captures ciblées <code>bin/capture-ecran.sh --region|--fenetre</code> · <b>Preuve :</b> <code>find</code>, <code>read mode:outline</code>, <code>fill direct</code> (0,25 s) et <code>eval timeout_ms</code> (échec 2 000 ms / succès 5 000 ms) validés via <code>/v2/cmd</code> ; <code>click_native</code> → <code>verified:true</code> ; <code>record start→stop</code> → MP4 h264 854×480, 10 fps, 4,000 s, 71 874 octets puis 2,000 s / 59 785 octets (ffprobe) ; capture <code>--region 0,0,800,600</code> → 800×600, <code>--fenetre "Chrome"</code> → 1936×1048 ; <code>cargo clippy -D warnings</code> vert ; service <code>dsh-eyes</code> actif ; md5 extension <code>1e0c04e4…</code> identique dépôt / installé / dossier chargé / paquet · <b>Prochaine étape :</b> aucune obligatoire · <b>Reste hors paquet (démon Rust) :</b> garde-fou d'hôte dans <code>/v2/cmd</code>, authentification de <code>/ws</code>, rate limit, handshake de version
 </div>
 <div class="toast" id="toast">📋 Copié</div>
 </div>
@@ -111,6 +111,7 @@ const COCKPIT={
     {ic:'🧭',nom:'Inventaire écosystème local IA',chemin:'Edy:~/.dsh/docs/ecosysteme-local.md'},
     {ic:'🦀',nom:'Standard qualité Rust (à charger avant tout code)',chemin:'Edy:~/.dsh/skills/dev-rust/'},
     {ic:'📂',nom:'Projet (repo git)',chemin:'Edy:~/projets/dsh-eyes/'},
+    {ic:'📦',nom:'Paquet extension 0.6.1 (Downloads)',chemin:'/mnt/c/Users/eddie/Downloads/dsh-eyes-extension-0.6.1/'},
   ],
   chantiers:[
     {n:'Task 1 — Scaffolding Rust + API /health',c:'curl http://127.0.0.1:8445/health → {"ok":true} ; cargo clippy -D warnings vert',cmds:['cd ~/projets/dsh-eyes && cargo check && cargo clippy -- -D warnings']},
@@ -120,6 +121,8 @@ const COCKPIT={
     {n:'Task 5 — Extension Chrome MV3',c:'extension chargée + 3 sites visités → /stats les compte ; zéro contenu de page capturé',cmds:[]},
     {n:'Task 6 — E2E + build statique musl',c:'file target/.../dsh-eyes → statically linked ; alerte localhost déclenchée par visite réelle de /health',cmds:['rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl']},
     {n:'Task 7 — Revue finale sécurité + maj inventaire',c:'clippy vert branche entière ; Edy:~/.dsh/docs/ecosysteme-local.md section DSH Eyes écrite',cmds:['cargo clippy -- -D warnings']},
+    {n:'v1.0.0 — version majeure (extension + démon alignés)',c:'/health renvoie 1.0.0 ; manifest 1.0.0 chargé ; find / read outline / fill direct / eval timeout_ms testés via /v2/cmd ; zip Downloads au même md5',cmds:['curl -s http://127.0.0.1:8445/health']},
+    {n:'Enregistrement d\'écran — routes /v2/record/*',c:'start → stop produit un MP4 h264 lisible (ffprobe : durée, fps, résolution) ; venv-rec avec mss/opencv/imageio/imageio-ffmpeg/numpy',cmds:['curl -s -X POST -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" -H "Content-Type: application/json" -d \'{"out":"C:\\\\Users\\\\eddie\\\\Videos\\\\dsh-test.mp4","duration":3,"fps":10,"resolution":"480p"}\' http://127.0.0.1:8445/v2/record/start']},
   ],
   regles:[
     'Preuve brute obligatoire : « ça devrait marcher » est interdit.',

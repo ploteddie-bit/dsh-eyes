@@ -304,14 +304,35 @@ const COMMAND_TIMEOUT_MS = 25_000;
 const READ_MAX_BYTES_DEFAULT = 200 * 1024; // 200 Ko
 
 /**
- * Dispatch principal d'une commande. Sécurisé par un timeout local.
+ * File d'attente par onglet (v0.6.1) : deux commandes concurrentes sur le
+ * même onglet se percutent sur chrome.debugger.attach (« Another debugger
+ * is already attached ») et brouillent les gestes. On chaîne les commandes
+ * par clé (tab_id explicite, sinon « global »).
+ */
+const commandChains = new Map();
+
+function withCommandLock(key, fn) {
+  const previous = commandChains.get(key) || Promise.resolve();
+  const run = previous.then(fn, fn);
+  const tracked = run.catch(() => {});
+  commandChains.set(key, tracked);
+  tracked.then(() => {
+    if (commandChains.get(key) === tracked) commandChains.delete(key);
+  });
+  return run;
+}
+
+/**
+ * Dispatch principal d'une commande. Sécurisé par un timeout local et
+ * sérialisé par onglet (v0.6.1).
  */
 async function handleCommand(cmd_id, cmd, params) {
   log(`commande #${cmd_id} ${cmd}`, params);
+  const cle = params && params.tab_id != null ? `tab:${params.tab_id}` : "global";
   let timer;
   try {
     const result = await Promise.race([
-      dispatchCommand(cmd, params),
+      withCommandLock(cle, () => dispatchCommand(cmd, params)),
       new Promise((_, reject) => {
         timer = setTimeout(
           () => reject(new Error(`timeout local ${COMMAND_TIMEOUT_MS} ms`)),
@@ -351,6 +372,8 @@ async function dispatchCommand(cmd, params) {
       return cmdGoto(params);
     case "read":
       return cmdRead(params);
+    case "find":
+      return cmdFind(params);
     case "click":
       return cmdClick(params);
     case "fill":
@@ -500,9 +523,46 @@ async function cmdGoto({ tab_id, url }) {
   return cmdTabsCreate({ url });
 }
 
-/** Lit le innerText d'un onglet via scripting.executeScript. */
-async function cmdRead({ tab_id, max_bytes }) {
+/** Lit un onglet. mode="text" (défaut) → innerText ; mode="outline" →
+ *  liste structurée des éléments interactifs visibles (v0.6.1). */
+async function cmdRead({ tab_id, max_bytes, mode }) {
   if (tab_id == null) throw new Error("read: 'tab_id' requis");
+  if (mode === "outline") {
+    const injection = () => {
+      const chemin = (el) => {
+        if (el.id) return "#" + CSS.escape(el.id);
+        const aria = el.getAttribute("aria-label");
+        if (aria) return el.tagName.toLowerCase() + '[aria-label="' + aria.replace(/"/g, '\\"') + '"]';
+        const name = el.getAttribute("name");
+        if (name) return el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]';
+        return el.tagName.toLowerCase();
+      };
+      const out = [];
+      const vus = new Set();
+      document.querySelectorAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab],[contenteditable=true]").forEach((el) => {
+        if (vus.has(el)) return;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return;
+        vus.add(el);
+        out.push({
+          tag: el.tagName.toLowerCase(),
+          role: el.getAttribute("role") || "",
+          text: (el.innerText || el.value || el.getAttribute("placeholder") || el.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ").slice(0, 90),
+          selector: chemin(el),
+          x: Math.round(r.x),
+          y: Math.round(r.y),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        });
+      });
+      return out.slice(0, 250);
+    };
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab_id },
+      func: injection,
+    });
+    return { mode: "outline", elements: res ? res.result : [] };
+  }
   const cap = Number.isFinite(max_bytes) ? max_bytes : READ_MAX_BYTES_DEFAULT;
   const injection = (cap) => {
     const full = document.body ? document.body.innerText : "";
@@ -521,7 +581,47 @@ async function cmdRead({ tab_id, max_bytes }) {
   if (typeof text !== "string") {
     throw new Error("read: résultat non-string");
   }
-  return { text };
+  return { mode: "text", text };
+}
+
+/**
+ * Cherche des éléments visibles par texte (v0.6.1) — le chaînon manquant
+ * entre `read` (texte brut) et `click_native_text` (un seul élément).
+ * Retourne une liste ordonnée avec géométrie viewport.
+ */
+async function cmdFind({ tab_id, text, selector, limit }) {
+  const id = await resolveTabId(tab_id);
+  const max = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const injection = (txt, sel, max) => {
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const base = sel
+      ? [...document.querySelectorAll(sel)]
+      : [...document.querySelectorAll("a,button,input,textarea,select,[role=button],[role=link],[role=tab]")];
+    const out = [];
+    for (const el of base) {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      const t = norm(el.innerText || el.value || el.getAttribute("aria-label") || "");
+      if (txt && !t.toLowerCase().includes(txt.toLowerCase())) continue;
+      out.push({
+        tag: el.tagName.toLowerCase(),
+        text: t.slice(0, 120),
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+      });
+      if (out.length >= max) break;
+    }
+    return out;
+  };
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: injection,
+    args: [typeof text === "string" ? text : "", typeof selector === "string" ? selector : "", max],
+  });
+  const elements = res ? res.result : [];
+  return { find: text || selector || "", count: elements.length, elements };
 }
 
 /**
@@ -532,8 +632,10 @@ async function cmdRead({ tab_id, max_bytes }) {
  * recevant `arg` (JSON). Les promesses sont attendues ; le résultat
  * est assaini (structure-cloneable) avant remontée vers le démon.
  * Retourne { value } — null si le code n'a rien retourné.
+ * v0.6.1 : `timeout_ms` paramétrable (défaut 8000, max 20000) — un script
+ * multi-actions de 12 s n'est plus tué à 8 s.
  */
-async function cmdEval({ tab_id, code, arg }) {
+async function cmdEval({ tab_id, code, arg, timeout_ms }) {
   if (typeof code !== "string" || !code.trim()) {
     throw new Error("eval: 'code' (string) requis");
   }
@@ -557,7 +659,7 @@ async function cmdEval({ tab_id, code, arg }) {
     }
     const v = rep.result && rep.result.value;
     return { value: v === undefined ? null : v };
-  });
+  }, false, timeout_ms);
 }
 
 // ── v0.4 : gestes NATIFS (chrome.debugger + Input.dispatch*) ────────────
@@ -591,8 +693,11 @@ const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
  *  v0.6.0 : `focus` optionnel (défaut false) — amène AUSSI la fenêtre au
  *  premier plan de l'OS. Constat GA4 20/10 : les Input CDP gèlent quand la
  *  FENÊTRE entière est derrière une autre (rendu suspendu par Windows).
- *  Vol de focus explicite = sur demande seulement (Eddie travaille). */
-async function withDebugger(tabId, fn, focus) {
+ *  Vol de focus explicite = sur demande seulement (Eddie travaille).
+ *  v0.6.1 : `timeout_ms` optionnel — plafond CDP par appel (défaut 8 s,
+ *  borné 1-20 s) et garde du geste à +5 s (max 24 s, sous le plafond 25 s).
+ *  Un `eval` multi-actions de 12 s n'est plus tué à 8 s. */
+async function withDebugger(tabId, fn, focus, timeout_ms) {
   try { await chrome.tabs.update(tabId, { active: true }); } catch (_) { /* fermé */ }
   if (focus) {
     try {
@@ -605,13 +710,15 @@ async function withDebugger(tabId, fn, focus) {
   }
   await sleepNat(180); // laisser le rendu de l'activation
   await chrome.debugger.attach({ tabId }, "1.3");
+  const cdpMs = Math.min(Math.max(Number(timeout_ms) || 8000, 1000), 20000);
   const dbg = (method, params) => Promise.race([
     chrome.debugger.sendCommand({ tabId }, method, params),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("CDP " + method + " sans réponse (8 s)")), 8000)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`CDP ${method} sans réponse (${cdpMs} ms)`)), cdpMs)),
   ]);
   try {
+    const gesteMs = Number(timeout_ms) ? Math.min(cdpMs + 5000, 24000) : 15000;
     const garde = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error("geste natif incomplet (15 s)")), 15000));
+      setTimeout(() => rej(new Error(`geste natif incomplet (${gesteMs} ms)`)), gesteMs));
     return await Promise.race([fn(dbg), garde]);
   } finally {
     try {
@@ -621,6 +728,33 @@ async function withDebugger(tabId, fn, focus) {
       ]);
     } catch (_) { /* déjà détaché */ }
   }
+}
+
+/** Lecture seule de l'état de page (v0.6.1) — sert à vérifier qu'un geste
+ *  natif a eu un effet observable (URL, scroll, DOM, focus, aria-*). */
+async function lireEtatPage(tabId) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const marqueurs = [...document.querySelectorAll("[aria-expanded],[aria-selected],[aria-checked]")]
+        .slice(0, 300)
+        .map((e) =>
+          (e.getAttribute("aria-expanded") || "") +
+          (e.getAttribute("aria-selected") || "") +
+          (e.getAttribute("aria-checked") || ""))
+        .join("|");
+      return {
+        url: location.href,
+        scrollY: Math.round(window.scrollY),
+        htmlLen: document.body ? document.body.innerHTML.length : 0,
+        actif: document.activeElement
+          ? document.activeElement.tagName + ":" + ((document.activeElement.innerText || "").trim().slice(0, 40))
+          : "",
+        marqueurs,
+      };
+    },
+  });
+  return res ? res.result : null;
 }
 
 /** Fraction gaussienne (Box-Muller) bornée [lo, hi] — jamais le centre exact. */
@@ -662,7 +796,8 @@ async function lireRect(id, selector) {
   return res ? res.result : null;
 }
 
-/** Clic natif : trajectoire + hésitation + press/release (isTrusted=true). */
+/** Clic natif : trajectoire + hésitation + press/release (isTrusted=true).
+ *  v0.6.1 : passe par le cœur partagé pour bénéficier de l'accusé vérifié. */
 async function cmdClickNative({ tab_id, selector, focus }) {
   if (typeof selector !== "string" || !selector) {
     throw new Error("click_native: 'selector' (string) requis");
@@ -671,22 +806,7 @@ async function cmdClickNative({ tab_id, selector, focus }) {
   const rect = await lireRect(id, selector);
   if (!rect) throw new Error("click_native: sélecteur introuvable: " + selector);
   if (!rect.visible) throw new Error("click_native: élément hors viewport (scroll_native d'abord)");
-  const cible = {
-    x: Math.round(rect.x + rect.w * fractionGaussienne()),
-    y: Math.round(rect.y + rect.h * fractionGaussienne()),
-  };
-  return withDebugger(id, async (dbg) => {
-    await deplacerCurseur(dbg, id, cible);
-    await sleepNat(40 + Math.random() * 60); // hésitation pré-clic
-    await dbg("Input.dispatchMouseEvent", {
-      type: "mousePressed", x: cible.x, y: cible.y, button: "left", clickCount: 1,
-    });
-    await sleepNat(45 + Math.random() * 50);
-    await dbg("Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1,
-    });
-    return { clicked: selector, at: cible, native: true };
-  }, focus);
+  return clicNatifSurRect(id, rect, selector, focus);
 }
 
 /** virtual-keycode minimal : lettres/chiffres/Espace/Entrée (reste → 0). */
@@ -819,13 +939,17 @@ async function cmdClickNativeRect({ tab_id, x, y, focus }) {
 }
 
 /** Cœur partagé des clics natifs : gaussienne dans le rect (si surface),
- *  trajectoire, hésitation, press/release — isTrusted=true. */
+ *  trajectoire, hésitation, press/release — isTrusted=true.
+ *  v0.6.1 : accusé VÉRIFIÉ — l'état de page (URL, scroll, DOM, focus,
+ *  aria-*) est capturé avant/après. `verified` dit si un effet a été
+ *  observé, ce qui permet au client de ne pas rejouer un clic à l'aveugle. */
 async function clicNatifSurRect(id, rect, libelle, focus) {
   const cible = {
     x: Math.round(rect.x + (rect.w > 8 ? rect.w * fractionGaussienne() : 0)),
     y: Math.round(rect.y + (rect.h > 8 ? rect.h * fractionGaussienne() : 0)),
   };
-  return withDebugger(id, async (dbg) => {
+  const avant = await lireEtatPage(id);
+  const rep = await withDebugger(id, async (dbg) => {
     await deplacerCurseur(dbg, id, cible);
     await sleepNat(40 + Math.random() * 60);
     await dbg("Input.dispatchMouseEvent", { type: "mousePressed", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
@@ -833,6 +957,16 @@ async function clicNatifSurRect(id, rect, libelle, focus) {
     await dbg("Input.dispatchMouseEvent", { type: "mouseReleased", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
     return { clicked: libelle, at: cible, native: true };
   }, focus);
+  await sleepNat(450);
+  const apres = await lireEtatPage(id);
+  const change = !!(avant && apres) && (
+    avant.url !== apres.url ||
+    avant.scrollY !== apres.scrollY ||
+    avant.htmlLen !== apres.htmlLen ||
+    avant.actif !== apres.actif ||
+    avant.marqueurs !== apres.marqueurs
+  );
+  return { ...rep, verified: change, verify_wait_ms: 450 };
 }
 
 /** Géométrie ÉCRAN d'un sélecteur : active l'onglet (le clic OS frappe ce
@@ -1086,7 +1220,7 @@ async function cmdClick({ tab_id, selector, direct }) {
 }
 
 /** Remplit un input/textarea — frappe clavier humaine char par char (v2.1). */
-async function cmdFill({ tab_id, selector, value }) {
+async function cmdFill({ tab_id, selector, value, direct }) {
   if (typeof selector !== "string" || !selector) {
     throw new Error("fill: 'selector' (string) requis");
   }
@@ -1094,6 +1228,32 @@ async function cmdFill({ tab_id, selector, value }) {
     throw new Error("fill: 'value' (string) requis");
   }
   const real_tab_id = await resolveTabId(tab_id);
+
+  // v0.6.1 : mode direct — une injection, setter natif + input/change,
+  // pour les champs non sensibles (11 s → <0,3 s). Le mode humain reste
+  // le défaut.
+  if (direct === true) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: real_tab_id },
+      func: (sel, val) => {
+        const el = document.querySelector(sel);
+        if (!el) throw new Error("sélecteur introuvable: " + sel);
+        el.scrollIntoView({ block: "center" });
+        el.focus();
+        const proto = el instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) setter.call(el, val);
+        else el.value = val;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return { value: el.value, length: el.value.length };
+      },
+      args: [selector, value],
+    });
+    return { filled: selector, mode: "direct", ...(res && res.result ? res.result : {}) };
+  }
 
   // 1) Focus + scrollIntoView centre (préparation humaine).
   await chrome.scripting.executeScript({

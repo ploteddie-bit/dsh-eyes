@@ -18,6 +18,7 @@ pub mod auth;
 pub mod config;
 pub mod hands;
 pub mod ingest;
+pub mod record;
 pub mod solver;
 pub mod state;
 pub mod stats;
