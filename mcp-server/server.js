@@ -141,10 +141,11 @@ serveur.registerTool(
   },
   async ({ tab_id, format }) => {
     const r = await appelJson("POST", "/v2/page/screenshot", { tab_id, format });
-    if (r.image) {
+    const b64 = r.image || r.b64;
+    if (b64) {
       return {
         content: [
-          { type: "image", data: r.image, mimeType: r.mime_type || "image/png" },
+          { type: "image", data: b64, mimeType: r.mime_type || "image/jpeg" },
           { type: "text", text: "Capture de l'onglet " + tab_id },
         ],
       };
