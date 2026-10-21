@@ -237,6 +237,24 @@ impl Metrics {
     }
 }
 
+/// Débit maximal de commandes API (token bucket global).
+const RATE_PER_SEC: f64 = 2.0; // 120 commandes/min
+const RATE_BURST: f64 = 60.0;  // rafale initiale
+
+struct RateState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Default for RateState {
+    fn default() -> Self {
+        Self {
+            tokens: RATE_BURST,
+            last: Instant::now(),
+        }
+    }
+}
+
 /// État partagé entre la boucle WS (`ingest::handle_socket`) et le
 /// routeur HTTP v2 (`api::v2_cmd`).
 ///
@@ -271,6 +289,8 @@ struct Inner {
     action_cache: StdMutex<HashMap<String, (Value, Instant)>>,
     /// Actions dont l'annulation a été demandée.
     cancelled_actions: StdMutex<HashSet<String>>,
+    /// Token bucket global des commandes API.
+    rate: StdMutex<RateState>,
 }
 
 /// Timeout par défaut d'attente de réponse d'une commande.
@@ -314,6 +334,7 @@ impl ExtensionChannel {
                 metrics: Metrics::default(),
                 action_cache: StdMutex::new(HashMap::new()),
                 cancelled_actions: StdMutex::new(HashSet::new()),
+                rate: StdMutex::new(RateState::default()),
             }),
         }
     }
@@ -373,6 +394,22 @@ impl ExtensionChannel {
     /// globale et par commande).
     pub fn metrics_snapshot(&self) -> Value {
         self.inner.metrics.snapshot()
+    }
+
+    /// Token bucket global des commandes API : 120/min, rafale 60.
+    /// Retourne `false` si le quota est épuisé (l'appelant renvoie 429).
+    pub fn check_rate_limit(&self) -> bool {
+        let mut r = self.inner.rate.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let elapsed = now.duration_since(r.last).as_secs_f64();
+        r.last = now;
+        r.tokens = (r.tokens + elapsed * RATE_PER_SEC).min(RATE_BURST);
+        if r.tokens >= 1.0 {
+            r.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 
     /// Retourne le résultat d'un batch `act` déjà exécuté (TTL 5 min).
@@ -1039,5 +1076,16 @@ mod tests {
         assert!(ch.is_action_cancelled("a1"));
         ch.clear_action_cancel("a1");
         assert!(!ch.is_action_cancelled("a1"));
+    }
+
+    #[test]
+    fn rate_limit_burst_et_refill() {
+        let ch = ExtensionChannel::new();
+        for _ in 0..(RATE_BURST as usize) {
+            assert!(ch.check_rate_limit());
+        }
+        assert!(!ch.check_rate_limit());
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(ch.check_rate_limit());
     }
 }

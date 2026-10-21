@@ -185,6 +185,10 @@ pub(crate) async fn send_cmd(
     cmd: impl Into<String>,
     params: Value,
 ) -> Result<Value, Response> {
+    if !channel.check_rate_limit() {
+        tracing::warn!("send_cmd : rate limit atteint (120/min, rafale 60)");
+        return Err(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
     match channel.send_command(cmd, params).await {
         Ok(resp) => {
             // resp.ok est toujours true ici (Channel mappe false → Err).
