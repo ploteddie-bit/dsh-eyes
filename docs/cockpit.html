@@ -134,6 +134,7 @@ const COCKPIT={
     {n:'E2E automatisé scripts/e2e.py',c:'17 contrôles PASS ; click_native_text verified avec focus:true ; multi-frame en attente du rechargement',cmds:['scripts/e2e.py']},
     {n:'Profils humains calme/normal/presse (phase 3)',c:'human_profile : jitter 40/24/12 px, typos 5/3/1,5 % ; valide live',cmds:['scripts/e2e.py']},
     {n:'Validation live multi-frame/shadow/heartbeat (1.1.0)',c:'capabilities multiframe, shadow_dom, heartbeat, human_profiles, allframes_target ; E2E --multiframe OK ; clics natifs shadow et iframe marqueurs true',cmds:['scripts/e2e.py --multiframe']},
+    {n:'MCP VS Code — 13 outils',c:'initialize/tools/list OK ; dsh_ping extension connectée 1.1.0 ; .vscode/mcp.json',cmds:['node mcp-server/server.js']},
   ],
   regles:[
     'Preuve brute obligatoire : « ça devrait marcher » est interdit.',

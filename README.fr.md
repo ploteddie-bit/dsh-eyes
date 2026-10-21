@@ -266,6 +266,27 @@ kill $DAEMON_PID
 
 Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
 
+## MCP (VS Code)
+
+Le serveur MCP `dsh-eyes` expose le harnais comme outils natifs VS Code.
+
+- **Configuration** : `.vscode/mcp.json` (stdio, `node mcp-server/server.js`,
+  `DSH_URL=http://127.0.0.1:8445`).
+- **Prérequis** : VS Code en Remote-WSL (ou `node` et le chemin
+  `/home/eddie/projets/dsh-eyes` accessibles), démon `dsh-eyes` actif, token
+  dans `~/.dsh-eyes/token`.
+- **Démarrage** : ouvrir le dossier `~/projets/dsh-eyes`, recharger la fenêtre
+  (`Developer: Reload Window`), puis `Ctrl+Shift+P` → `MCP: List Servers` →
+  démarrer `dsh-eyes`.
+- **Outils (13)** : `dsh_ping`, `dsh_open`, `dsh_goto`, `dsh_read`,
+  `dsh_click`, `dsh_fill`, `dsh_wait`, `dsh_screenshot`, `dsh_captcha`,
+  `dsh_events`, `dsh_act`, `dsh_act_cancel`, `dsh_metrics`.
+- **Batch idempotent** : `dsh_act` accepte `action_id` ; `dsh_act_cancel`
+  annule entre deux étapes ; `dsh_metrics` expose volumes, issues et latence.
+
+Vérifié en stdio : `initialize` → `dsh-eyes 1.1.0`, `tools/list` → 13 outils,
+`dsh_ping` → extension connectée.
+
 ## E2E automatisé
 
 ```bash

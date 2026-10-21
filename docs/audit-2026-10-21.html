@@ -47,7 +47,7 @@
     <div class="card"><div class="k">Démon Rust</div><div class="v">1.0.0 · actif</div></div>
     <div class="card"><div class="k">Extension chargée</div><div class="v">1.0.2</div></div>
     <div class="card"><div class="k">Commandes extension</div><div class="v">19</div></div>
-    <div class="card"><div class="k">Outils MCP</div><div class="v">9 · non configurés</div></div>
+    <div class="card"><div class="k">Outils MCP</div><div class="v">13 · VS Code</div></div>
     <div class="card"><div class="k">Tests Rust</div><div class="v">124 · 2 ignorés</div></div>
   </div>
 
@@ -63,6 +63,7 @@
   </ol>
 
   <h2>1. Périmètre et versions réelles</h2>
+  <div class="note"><b>Snapshot initial.</b> Le tableau ci-dessous décrit l'état au commit <code>7fe4a38</code> (avant phase 0) ; l'état après implémentation est décrit en section 9.</div>
   <table>
     <thead><tr><th>Composant</th><th>Version / état</th><th>Preuve</th></tr></thead>
     <tbody>
@@ -228,7 +229,7 @@
     <li><b>SSRF</b> : validateur centralisé sur <code>/v2/open</code>, <code>/v2/goto</code> et <code>/v2/cmd</code> ; refus des IP loopback/privées/link-local/ULA et des formes déguisées ; backslash d'autorité refusé (bloquant trouvé par le contradicteur).</li>
     <li><b>Rédaction</b> : <code>value</code>, <code>text</code>, <code>code</code>, jetons et images masqués dans <code>actions.jsonl</code>.</li>
     <li><b>Extension</b> : <code>tabs_create</code> navigue l'onglet réutilisé, listener <code>onAlarm</code> idempotent, humanisation Bézier/typos/scroll branchée sur CDP.</li>
-    <li><b>MCP</b> : <code>dsh_ping</code> réel, <code>dsh_read</code> avec <code>mode</code>, <code>dsh_wait</code> corrigé, <code>dsh_events</code> limité, mime screenshot correct, clic natif exposé.</li>
+    <li><b>MCP</b> : 13 outils, <code>.vscode/mcp.json</code>, <code>dsh_act</code>/<code>dsh_act_cancel</code>/<code>dsh_metrics</code> ; <code>dsh_ping</code> réel, <code>dsh_read</code> avec <code>mode</code>, <code>dsh_wait</code> corrigé, <code>dsh_events</code> limité, mime screenshot correct, clic natif exposé ; <code>initialize</code>/<code>tools/list</code> testés en stdio (<code>dsh_ping</code> → extension connectée 1.1.0).</li>
     <li><b>Logs</b> : rotation au démarrage au-delà de 50 Mo (3 archives).</li>
     <li><b>Métriques (phase 4, première brique)</b> : <code>GET /v2/metrics</code> expose volumes, issues, latence globale et par commande.</li>
     <li><b>Act batch (phase 2, première brique)</b> : <code>POST /v2/act</code> + <code>POST /v2/act/cancel</code>, <code>action_id</code> mémorisé 5 min, propagation du <code>tab_id</code> ; idempotence et annulation coopérative validées live.</li>
