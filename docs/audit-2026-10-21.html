@@ -220,8 +220,22 @@
     <li>Le test WS de l'audit a cassé le canal (504) ; le redémarrage du service l'a rétabli — preuve directe du bug « dernière connexion gagne ».</li>
   </ul>
 
-  <h2>9. Verdict</h2>
-  <p><b>Statut réel :</b> prototype avancé et fonctionnel localement, pas encore fiable pour un pilotage M2M autonome. <b>Portée réelle :</b> Chrome personnel d'Eddie, extension 1.0.2 chargée, démon 1.0.0 actif, MCP prêt mais non branché. <b>Priorité :</b> consolider le transport et la sécurité (phases 0-1) avant d'ajouter des commandes ou de l'humanisation. <b>Prochaine étape recommandée :</b> traiter les cinq quick wins de la phase 0, puis mesurer la stabilité sur 24 h (zéro <code>CLOSE-WAIT</code>, zéro 504 non expliqué).</p>
+  <h2>9. Phase 0 — implémentation (21/10/2026)</h2>
+  <p>Le socle a été implémenté dans la branche <code>main</code> (commits <code>6ec8cb1</code>, <code>c4cf1ae</code>, <code>20c49bd</code>), version <code>1.1.0</code> :</p>
+  <ul>
+    <li><b>Auth WS</b> : token en query string, comparaison en temps constant, handshake <code>hello</code> (client, version, capacités) exposé par <code>GET /v2/info</code> ; page d'options pour saisir le token.</li>
+    <li><b>Deadlock</b> : <code>drop(handle)</code> avant l'attente du bridge, timeouts de 2 s, zéro <code>CLOSE-WAIT</code> après redémarrage.</li>
+    <li><b>SSRF</b> : validateur centralisé sur <code>/v2/open</code>, <code>/v2/goto</code> et <code>/v2/cmd</code> ; refus des IP loopback/privées/link-local/ULA et des formes déguisées ; backslash d'autorité refusé (bloquant trouvé par le contradicteur).</li>
+    <li><b>Rédaction</b> : <code>value</code>, <code>text</code>, <code>code</code>, jetons et images masqués dans <code>actions.jsonl</code>.</li>
+    <li><b>Extension</b> : <code>tabs_create</code> navigue l'onglet réutilisé, listener <code>onAlarm</code> idempotent, humanisation Bézier/typos/scroll branchée sur CDP.</li>
+    <li><b>MCP</b> : <code>dsh_ping</code> réel, <code>dsh_read</code> avec <code>mode</code>, <code>dsh_wait</code> corrigé, <code>dsh_events</code> limité, mime screenshot correct, clic natif exposé.</li>
+    <li><b>Logs</b> : rotation au démarrage au-delà de 50 Mo (3 archives).</li>
+    <li><b>Tests</b> : 129 passés, 2 ignorés ; nouveaux tests SSRF <code>/v2/cmd</code>, backslash, WS 401, rédaction.</li>
+  </ul>
+  <p><b>Limites restantes (phase 1)</b> : redirections HTTP et DNS rebinding non re-vérifiés, <code>eval</code> reste une exécution JS arbitraire, token vide désactive l'auth WS sans alerte, MCP non câblé dans un client, tests <code>record</code>/<code>hands</code> toujours absents.</p>
+
+  <h2>10. Verdict</h2>
+  <p><b>Statut réel :</b> phase 0 implémentée et testée (129 tests, clippy vert, binaire musl 1.1.0 construit). <b>Portée réelle :</b> Chrome personnel d'Eddie, extension 1.1.0 déployée dans le dossier chargé, démon 1.1.0 installé mais pas encore redémarré. <b>Prochaine étape :</b> recharger l'extension, saisir le token dans Options, redémarrer le démon, puis vérifier <code>/v2/info</code> et l'absence de <code>CLOSE-WAIT</code> sur 24 h.</p>
 
   <footer>
     Audit réalisé le 21 octobre 2026 · sources : code Rust, extension MV3, serveur MCP, runtime local, dépôt <code>ploteddie-bit/dsh-eyes</code> (HEAD <code>7fe4a38</code>) · aucun fichier du projet modifié pendant l'audit.
