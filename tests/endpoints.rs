@@ -584,3 +584,53 @@ async fn ws_sans_token_refuse_401() {
         other => panic!("attendu 401, reçu {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn act_batch_idempotent_avec_action_id() {
+    let (token, addr, channel) = start_server_with_token().await;
+    let (mut ws_rx, mut ws_tx) = open_fake_extension(addr, &token, &channel).await;
+
+    let token2 = token.clone();
+    let body = r#"{"action_id":"a-test","steps":[{"cmd":"read","params":{"tab_id":1}},{"cmd":"read","params":{"tab_id":1}}]}"#;
+    let post_task = tokio::spawn(async move {
+        post(addr, "/v2/act", Some(&format!("Bearer {token2}")), body).await
+    });
+
+    let cmd = read_command(&mut ws_rx).await;
+    assert_eq!(cmd["cmd"], "read");
+    let id1 = cmd["cmd_id"].as_u64().expect("cmd_id 1");
+    send_response(&mut ws_tx, id1, json!({"text": "un"})).await;
+
+    let cmd = read_command(&mut ws_rx).await;
+    assert_eq!(cmd["cmd"], "read");
+    let id2 = cmd["cmd_id"].as_u64().expect("cmd_id 2");
+    send_response(&mut ws_tx, id2, json!({"text": "deux"})).await;
+
+    let (status, body) = post_task.await.expect("post_task join");
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["cached"], false);
+    assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    assert_eq!(body["results"][0]["result"]["text"], "un");
+    assert_eq!(body["results"][1]["result"]["text"], "deux");
+
+    // Même action_id : le cache répond sans repousser de commande.
+    let (status, body) = post(
+        addr,
+        "/v2/act",
+        Some(&format!("Bearer {token}")),
+        r#"{"action_id":"a-test","steps":[{"cmd":"read","params":{"tab_id":1}}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["cached"], true);
+    assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_command(&mut ws_rx))
+            .await
+            .is_err(),
+        "le cache ne doit pas repousser de commande"
+    );
+
+    let _ = ws_tx.send(Message::Close(None)).await;
+}

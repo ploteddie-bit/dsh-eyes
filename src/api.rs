@@ -370,6 +370,168 @@ async fn v2_cmd(
     }
 }
 
+// ─── Act batch : idempotence + annulation coopérative ────────────────────
+
+/// Une étape d'un batch `act`.
+#[derive(Debug, Deserialize)]
+pub struct ActStep {
+    pub cmd: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// Corps de `POST /v2/act`.
+#[derive(Debug, Deserialize)]
+pub struct ActRequest {
+    pub steps: Vec<ActStep>,
+    #[serde(default)]
+    pub action_id: Option<String>,
+}
+
+/// Corps de `POST /v2/act/cancel`.
+#[derive(Debug, Deserialize)]
+pub struct ActCancelRequest {
+    pub action_id: String,
+}
+
+/// Handler `POST /v2/act` — exécute une séquence d'étapes, dans l'ordre,
+/// avec un `action_id` optionnel. Le résultat est mémorisé 5 min : un
+/// second appel avec le même `action_id` renvoie le cache sans rejouer
+/// les étapes. L'annulation est coopérative entre deux étapes via
+/// `POST /v2/act/cancel`.
+async fn v2_act(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<ActRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    if req.steps.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty_steps");
+    }
+    if req.steps.len() > 50 {
+        return error_response(StatusCode::BAD_REQUEST, "too_many_steps");
+    }
+    let action_id = req.action_id.clone();
+
+    if let Some(id) = action_id.as_deref() {
+        if let Some(cached) = channel.cached_action(id) {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "action_id": id,
+                    "cached": true,
+                    "results": cached,
+                })),
+            )
+                .into_response();
+        }
+        // Un nouveau batch avec le même id repart d'un état propre.
+        channel.clear_action_cancel(id);
+    }
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut last_tab_id: Option<i64> = None;
+    for (idx, step) in req.steps.iter().enumerate() {
+        if let Some(id) = action_id.as_deref() {
+            if channel.is_action_cancelled(id) {
+                channel.clear_action_cancel(id);
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "ok": false,
+                        "action_id": id,
+                        "error": "cancelled",
+                        "step": idx,
+                        "results": results,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        if matches!(step.cmd.as_str(), "goto" | "tabs_create" | "open") {
+            if let Some(url) = step.params.get("url").and_then(|v| v.as_str()) {
+                if let Err(resp) = validate_target_url(url).await {
+                    return resp;
+                }
+            }
+        }
+        // Propagation du tab_id : après un tabs_create/goto, les étapes
+        // suivantes sans tab_id explicite ciblent l'onglet créé. C'est
+        // le comportement attendu d'un batch séquentiel.
+        let mut params = if step.params.is_object() {
+            step.params.clone()
+        } else {
+            json!({})
+        };
+        if !matches!(step.cmd.as_str(), "tabs_create" | "goto" | "open")
+            && params.get("tab_id").is_none()
+        {
+            if let Some(id) = last_tab_id {
+                params["tab_id"] = json!(id);
+            }
+        }
+        log_action(
+            "act",
+            json!({
+                "action_id": action_id.as_deref(),
+                "step": idx,
+                "cmd": step.cmd.as_str(),
+            }),
+        );
+        match send_cmd(&channel, step.cmd.clone(), params).await {
+            Ok(result) => {
+                if let Some(id) = result.get("tab_id").and_then(|v| v.as_i64()) {
+                    last_tab_id = Some(id);
+                }
+                results.push(json!({
+                    "cmd": step.cmd.as_str(),
+                    "ok": true,
+                    "result": result,
+                }));
+            }
+            Err(resp) => return resp,
+        }
+    }
+
+    let results_value = Value::Array(results);
+    if let Some(id) = action_id.as_deref() {
+        channel.cache_action(id, results_value.clone());
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "action_id": action_id,
+            "cached": false,
+            "results": results_value,
+        })),
+    )
+        .into_response()
+}
+
+/// Handler `POST /v2/act/cancel` — pose le drapeau d'annulation d'un
+/// batch. Le handler `act` le vérifie avant chaque étape.
+async fn v2_act_cancel(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<ActCancelRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let id = req.action_id.trim();
+    if id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing_action_id");
+    }
+    channel.cancel_action(id);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "action_id": id,
+            "cancelled": true,
+        })),
+    )
+        .into_response()
+}
+
 // ─── Task 3 : endpoints de commodité ──────────────────────────────────────
 
 /// Corps de `POST /v2/open` : une URL à ouvrir dans un nouvel onglet.
@@ -886,6 +1048,8 @@ fn v2_router(
         .route("/info", get(v2_info))
         .route("/metrics", get(v2_metrics))
         .route("/cmd", post(v2_cmd))
+        .route("/act", post(v2_act))
+        .route("/act/cancel", post(v2_act_cancel))
         .route("/open", post(v2_open))
         .route("/read", post(v2_read))
         .route("/goto", post(v2_goto))

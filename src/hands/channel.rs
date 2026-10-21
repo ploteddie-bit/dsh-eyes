@@ -36,7 +36,7 @@
 //!   Le `cmd_id` est utilisé pour router la réponse vers le `oneshot`
 //!   de la requête correspondante.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -267,6 +267,10 @@ struct Inner {
     tab_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     /// Compteurs d'observabilité (volumes, issues, latence).
     metrics: Metrics,
+    /// Cache des résultats de batches `act` par `action_id` (TTL 5 min).
+    action_cache: StdMutex<HashMap<String, (Value, Instant)>>,
+    /// Actions dont l'annulation a été demandée.
+    cancelled_actions: StdMutex<HashSet<String>>,
 }
 
 /// Timeout par défaut d'attente de réponse d'une commande.
@@ -308,6 +312,8 @@ impl ExtensionChannel {
                 hello: Mutex::new(None),
                 tab_locks: Mutex::new(HashMap::new()),
                 metrics: Metrics::default(),
+                action_cache: StdMutex::new(HashMap::new()),
+                cancelled_actions: StdMutex::new(HashSet::new()),
             }),
         }
     }
@@ -367,6 +373,54 @@ impl ExtensionChannel {
     /// globale et par commande).
     pub fn metrics_snapshot(&self) -> Value {
         self.inner.metrics.snapshot()
+    }
+
+    /// Retourne le résultat d'un batch `act` déjà exécuté (TTL 5 min).
+    /// Le cache ne contient que les succès : une erreur ou un timeout
+    /// n'est pas mémorisé, pour permettre un retry après incident
+    /// transitoire.
+    pub fn cached_action(&self, id: &str) -> Option<Value> {
+        let mut cache = self.inner.action_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        cache.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(300));
+        cache.get(id).map(|(v, _)| v.clone())
+    }
+
+    /// Mémorise le résultat d'un batch `act` réussi.
+    pub fn cache_action(&self, id: &str, value: Value) {
+        let mut cache = self.inner.action_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        cache.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(300));
+        if cache.len() >= 1000 {
+            cache.clear();
+        }
+        cache.insert(id.to_string(), (value, now));
+    }
+
+    /// Demande l'annulation d'un batch `act`. L'annulation est
+    /// coopérative : le handler vérifie le drapeau entre deux étapes.
+    pub fn cancel_action(&self, id: &str) {
+        let mut set = self.inner.cancelled_actions.lock().unwrap_or_else(|e| e.into_inner());
+        if set.len() >= 1000 {
+            set.clear();
+        }
+        set.insert(id.to_string());
+    }
+
+    pub fn is_action_cancelled(&self, id: &str) -> bool {
+        self.inner
+            .cancelled_actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    pub fn clear_action_cancel(&self, id: &str) {
+        self.inner
+            .cancelled_actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// Retourne le verrou associé à un `tab_id` explicite. La map grandit
@@ -972,5 +1026,18 @@ mod tests {
         assert_eq!(snap["commands"]["in_flight"], 0);
         assert_eq!(snap["commands"]["per_command"]["goto"]["ok"], 1);
         assert_eq!(snap["commands"]["per_command"]["read"]["timeout"], 1);
+    }
+
+    #[test]
+    fn cache_et_annulation_actions() {
+        let ch = ExtensionChannel::new();
+        assert!(ch.cached_action("a1").is_none());
+        ch.cache_action("a1", serde_json::json!({"results": [1, 2]}));
+        assert_eq!(ch.cached_action("a1").unwrap()["results"][1], 2);
+        assert!(!ch.is_action_cancelled("a1"));
+        ch.cancel_action("a1");
+        assert!(ch.is_action_cancelled("a1"));
+        ch.clear_action_cancel("a1");
+        assert!(!ch.is_action_cancelled("a1"));
     }
 }
