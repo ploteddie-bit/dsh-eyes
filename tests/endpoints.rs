@@ -545,3 +545,42 @@ async fn open_journalise_dans_actions_jsonl() {
 
     let _ = ws_tx.send(Message::Close(None)).await;
 }
+
+#[tokio::test]
+async fn cmd_ssrf_localhost_refuse_403() {
+    let (token, addr, _channel) = start_server_with_token().await;
+    let auth = format!("Bearer {token}");
+    let body = r#"{"cmd":"tabs_create","params":{"url":"http://127.0.0.1/"}}"#;
+    let (status, v) = post(addr, "/v2/cmd", Some(auth.as_str()), body).await;
+    assert_eq!(status, 403, "body={v}");
+    assert_eq!(v["error"], "forbidden_target");
+}
+
+#[tokio::test]
+async fn cmd_ssrf_backslash_refuse_400() {
+    let (token, addr, _channel) = start_server_with_token().await;
+    let auth = format!("Bearer {token}");
+    // JSON : un backslash littéral (échappé en \\ dans la chaîne JSON).
+    // Chrome le traite comme un séparateur d'autorité : la validation
+    // doit refuser avant que tabs_create ne navigue vers 127.0.0.1.
+    let body = r#"{"cmd":"tabs_create","params":{"url":"http://127.0.0.1\\evil.com/"}}"#;
+    let (status, v) = post(addr, "/v2/cmd", Some(auth.as_str()), body).await;
+    assert_eq!(status, 400, "body={v}");
+    assert_eq!(v["error"], "invalid_url");
+}
+
+#[tokio::test]
+async fn ws_sans_token_refuse_401() {
+    let (_token, addr, _channel) = start_server_with_token().await;
+    let url = format!("ws://{addr}/ws");
+    let err = match tokio_tungstenite::connect_async(&url).await {
+        Ok(_) => panic!("la WS sans token ne doit pas s'ouvrir"),
+        Err(e) => e,
+    };
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            assert_eq!(resp.status().as_u16(), 401);
+        }
+        other => panic!("attendu 401, reçu {other:?}"),
+    }
+}

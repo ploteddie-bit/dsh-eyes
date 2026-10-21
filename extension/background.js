@@ -879,9 +879,11 @@ function vkDe(ch) {
   return 0;
 }
 
-/** Frappe native caractère par caractère : keyDown(text) + keyUp, dwell
- *  40-160 ms — jamais keyboard.press (dwell nul = signature). */
-async function cmdTypeNative({ tab_id, selector, text, submit }) {
+/** Frappe native caractère par caractère : keyDown(text) + keyUp, plan
+ *  humain (délais lognormaux, typos, backspace) — jamais keyboard.press.
+ *  `timeout_ms` optionnel : budget du geste (défaut calculé sur la
+ *  longueur du texte, borné à 24 s par withDebugger). */
+async function cmdTypeNative({ tab_id, selector, text, submit, timeout_ms }) {
   if (typeof text !== "string") throw new Error("type_native: 'text' (string) requis");
   const id = await resolveTabId(tab_id);
   if (selector) {
@@ -901,6 +903,9 @@ async function cmdTypeNative({ tab_id, selector, text, submit }) {
     });
     if (!res || !res.result) throw new Error("type_native: sélecteur introuvable: " + selector);
   }
+  // Budget temps : la frappe humaine coûte ~90-400 ms/caractère. Sans
+  // budget explicite, la garde de 15 s coupait les textes > ~90 caractères.
+  const budget = Number(timeout_ms) || Math.min(24000, Math.max(15000, 5000 + text.length * 90));
   return withDebugger(id, async (dbg) => {
     // Plan de frappe humain : délais lognormaux, typos QWERTY (~3 %) et
     // corrections backspace. Les gestes CDP ne sont plus une frappe
@@ -941,7 +946,7 @@ async function cmdTypeNative({ tab_id, selector, text, submit }) {
       });
     }
     return { typed: text.length, submit: !!submit, native: true };
-  });
+  }, undefined, budget);
 }
 
 /** Molette native : crans réalistes 90-135 px, 30-70 ms d'écart — jamais
@@ -956,6 +961,8 @@ async function cmdScrollNative({ tab_id, dy }) {
   // Plan de scroll humain : crans progressifs 80-300 px, accélération puis
   // freinage, délais 120-450 ms. Remplace la boucle mécanique 90-135 px.
   const plan = humanScrollPlan(Math.abs(total), { direction: sens > 0 ? "down" : "up" });
+  // Budget temps proportionnel au plan (un cran = 120-450 ms).
+  const budget = Math.min(24000, Math.max(15000, 5000 + plan.length * 450));
   return withDebugger(id, async (dbg) => {
     let crans = 0;
     for (const step of plan) {
@@ -963,6 +970,9 @@ async function cmdScrollNative({ tab_id, dy }) {
       if (!nativeCursor.has(id)) {
         await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
         await sleepNat(80 + Math.random() * 120);
+        // Mémorise la position : sans ce set, le mouseMoved + son délai
+        // étaient rejoués à CHAQUE cran et faisaient dépasser la garde.
+        nativeCursor.set(id, p);
       }
       await dbg("Input.dispatchMouseEvent", {
         type: "mouseWheel", x: p.x, y: p.y, deltaX: 0,
@@ -972,7 +982,7 @@ async function cmdScrollNative({ tab_id, dy }) {
       await sleepNat(step.delayMs);
     }
     return { scrolled: total, crans, native: true };
-  });
+  }, undefined, budget);
 }
 
 /** Trouve un élément PAR TEXTE (lecture seule) et renvoie son rect viewport.

@@ -263,11 +263,12 @@ pub fn actions_jsonl_path() -> PathBuf {
 /// jetons et images base64. Le but est de garder une trace exploitable
 /// sans conserver de secret ni de gros payload.
 fn redact_params(mut value: Value) -> Value {
-    const SENSITIVE: [&str; 7] = [
+    const SENSITIVE: [&str; 8] = [
         "value",
         "password",
         "token",
         "code",
+        "text",
         "image_b64",
         "data_url",
         "b64",
@@ -809,7 +810,11 @@ fn extract_host(url: &str) -> Option<String> {
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
     let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() || authority.contains('@') {
+    // `@` = userinfo (http://user@host/). `\` = séparateur selon le
+    // parser WHATWG de Chrome : `http://127.0.0.1\evil.com/` devient
+    // `http://127.0.0.1/evil.com/`. On refuse tout backslash dans
+    // l'autorité pour ne pas laisser passer une cible locale déguisée.
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
         return None;
     }
     let host = if let Some(stripped) = authority.strip_prefix('[') {
@@ -992,4 +997,28 @@ pub fn router_with_v2(
             crate::record::RecordState::default(),
         ),
     )
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_params;
+    use serde_json::json;
+
+    #[test]
+    fn redact_masque_value_text_code_et_images() {
+        let out = redact_params(json!({
+            "value": "secret",
+            "text": "mot de passe",
+            "code": "fetch('x')",
+            "image_b64": "AAAA",
+            "selector": "#ok",
+            "tab_id": 1
+        }));
+        assert_eq!(out["value"], "[redacted]");
+        assert_eq!(out["text"], "[redacted]");
+        assert_eq!(out["code"], "[redacted]");
+        assert_eq!(out["image_b64"], "[redacted]");
+        assert_eq!(out["selector"], "#ok");
+        assert_eq!(out["tab_id"], 1);
+    }
 }
