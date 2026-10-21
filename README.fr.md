@@ -9,10 +9,10 @@ Démon d'observation des navigations Chrome + **mains** du navigateur
 
 - Endpoint HTTP+WS : `http://127.0.0.1:8445` (health, stats, events, alerts, ws)
 - Routes v1 (ouvertes) : `GET /health`, `GET /stats`, `GET /events`, `GET /alerts`, `WS /ws`
-- Routes v2 (auth Bearer) : `GET /v2/info`, `GET /v2/metrics`, `GET /v2/ping`, `POST /v2/cmd`
+- Routes v2 (auth Bearer) : `GET /v2/info`, `GET /v2/metrics`, `GET /v2/ping`, `POST /v2/cmd`, `POST /v2/act`, `POST /v2/act/cancel`
 - Source : `src/` (Rust, axum 0.7 + tokio + tokio-tungstenite)
-- Tests : `tests/` — **135 tests exécutés** (21/10/2026), `cargo test` ; 2 ignorés (live Ollama + doc-test `ignore`)
-- **v1.1.0** : auth WS par token + handshake `hello`, garde-fou SSRF centralisé sur `/v2/cmd`, humanisation CDP, rotation des logs, `GET /v2/info`, métriques `GET /v2/metrics`
+- Tests : `tests/` — **138 tests exécutés** (21/10/2026), `cargo test` ; 2 ignorés (live Ollama + doc-test `ignore`)
+- **v1.1.0** : auth WS par token + handshake `hello`, garde-fou SSRF centralisé sur `/v2/cmd`, humanisation CDP, rotation des logs, `GET /v2/info`, métriques `GET /v2/metrics`, act batch idempotent (`POST /v2/act`, annulation coopérative)
 - Extension Chrome : `extension/` (MV3, à charger via `chrome://extensions` mode développeur)
 - Cockpit : `docs/cockpit.html`
 
@@ -70,6 +70,31 @@ handshake `hello` (client, version, capacités) exposé par `GET /v2/info` :
 curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" \
   http://127.0.0.1:8445/v2/info
 ```
+
+### Act batch — idempotence et annulation (v1.1.0)
+
+`POST /v2/act` exécute une séquence d'étapes dans l'ordre :
+
+```bash
+curl -X POST -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" \
+  -H "Content-Type: application/json" \
+  -d '{"action_id":"batch-1","steps":[
+    {"cmd":"tabs_create","params":{"url":"https://example.com"}},
+    {"cmd":"read","params":{"mode":"outline"}}
+  ]}' http://127.0.0.1:8445/v2/act
+```
+
+- `action_id` optionnel : le résultat d'un batch réussi est mémorisé 5 min ;
+  un second appel avec le même id renvoie `cached:true` sans rejouer les étapes.
+- Le `tab_id` retourné par `tabs_create`/`goto` est propagé aux étapes suivantes
+  qui n'en fournissent pas.
+- `POST /v2/act/cancel {"action_id":"batch-1"}` pose un drapeau d'annulation
+  coopérative : le batch s'arrête avant l'étape suivante et renvoie
+  `409 {"error":"cancelled","step":N,"results":[…]}`.
+- Maximum 50 étapes ; le garde-fou SSRF est appliqué à chaque étape
+  `goto`/`tabs_create`/`open`.
+- Sur erreur d'une étape, la réponse d'erreur du démon est renvoyée (les
+  résultats partiels ne sont pas inclus).
 
 Commandes supportées (cf. `extension/background.js`) :
 
@@ -231,7 +256,7 @@ Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
 
 ## Limites connues (v1.1.0)
 
-- **Tests `record`** : les 135 tests couvrent l'existant ; aucune suite dédiée aux routes `/v2/record/*` ni au CLI Python.
+- **Tests `record`** : les 138 tests couvrent l'existant ; aucune suite dédiée aux routes `/v2/record/*` ni au CLI Python.
 - **Audio** : `rec_ecran_cli.py` capture la vidéo seule ; le micro et l'audio système de l'application d'origine ne sont pas intégrés.
 - **Sécurité du démon** : `/v2/cmd` réapplique `is_forbidden_host` depuis la v1.1.0 ; `/ws` exige le token ; pas encore de rate limit ; `eval` reste une exécution JS arbitraire ; le handshake `hello` est informatif (pas de refus automatique en cas de version incompatible).
 - **Doc-test ignoré** : `src/vigil.rs:283` est un exemple ` ```ignore `, non exécuté — il ne compte pas comme test.
