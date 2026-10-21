@@ -20,13 +20,29 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+/// Utilisateur courant : le démon tourne sous WSL, `USER` y est défini
+/// (systemd user service). Repli neutre si la variable est absente.
+fn utilisateur() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "user".to_string())
+}
+
 /// Python du venv dédié. Chemin **WSL** : le démon est un processus Linux,
 /// l'interop traduit l'exécution vers Windows. Les arguments, eux, restent
 /// des chemins Windows compris par ce Python.
-const DEFAULT_PYTHON: &str =
-    "/mnt/c/Users/eddie/Documents/Mon Enregistreur/venv-rec/Scripts/python.exe";
+fn default_python() -> String {
+    format!(
+        "/mnt/c/Users/{}/Documents/Mon Enregistreur/venv-rec/Scripts/python.exe",
+        utilisateur()
+    )
+}
+
 /// CLI déployé côté Windows (argument, donc chemin Windows).
-const DEFAULT_SCRIPT: &str = r"C:\Users\eddie\Documents\Mon Enregistreur\rec_ecran_cli.py";
+fn default_script() -> String {
+    format!(
+        r"C:\Users\{}\Documents\Mon Enregistreur\rec_ecran_cli.py",
+        utilisateur()
+    )
+}
 
 #[derive(Clone, Default)]
 pub struct RecordState {
@@ -42,7 +58,7 @@ struct Session {
 
 #[derive(Deserialize, Default)]
 pub struct StartReq {
-    /// Chemin Windows du MP4. Défaut : `C:\Users\eddie\Videos\dsh-record-<ts>.mp4`.
+    /// Chemin Windows du MP4. Défaut : `C:\Users\<utilisateur>\Videos\dsh-record-<ts>.mp4`.
     pub out: Option<String>,
     pub fps: Option<u32>,
     pub resolution: Option<String>,
@@ -75,7 +91,10 @@ fn default_out() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!(r"C:\Users\eddie\Videos\dsh-record-{now}.mp4")
+    format!(
+        r"C:\Users\{}\Videos\dsh-record-{now}.mp4",
+        utilisateur()
+    )
 }
 
 fn erreur(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -98,14 +117,15 @@ pub async fn start(
 
     let out = req.out.unwrap_or_else(default_out);
     let stop_win = format!(
-        r"C:\Users\eddie\AppData\Local\Temp\dsh-record-stop-{}.flag",
+        r"C:\Users\{}\AppData\Local\Temp\dsh-record-stop-{}.flag",
+        utilisateur(),
         jeton()
     );
     let stop_wsl = win_to_wsl(&stop_win);
     let _ = std::fs::remove_file(&stop_wsl);
 
-    let python = req.python.unwrap_or_else(|| DEFAULT_PYTHON.to_string());
-    let script = req.script.unwrap_or_else(|| DEFAULT_SCRIPT.to_string());
+    let python = req.python.unwrap_or_else(default_python);
+    let script = req.script.unwrap_or_else(default_script);
 
     let mut cmd = Command::new(&python);
     cmd.arg(&script)

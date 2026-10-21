@@ -248,7 +248,7 @@ async fn vigil_reload_if_changed_fichier_absent_allowlist_vide() {
     let allow = Allowlist::load_or_default();
     assert!(allow.contains("github.com"));
 
-    // 2) Suppression du fichier (simule « Eddie a effacé l'allowlist »).
+    // 2) Suppression du fichier (simule « l'opérateur a effacé l'allowlist »).
     std::fs::remove_file(home.join("allowlist.json"))
         .expect("rm allowlist.json");
 

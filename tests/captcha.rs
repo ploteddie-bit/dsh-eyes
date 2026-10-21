@@ -3,7 +3,7 @@
 //!
 //! ## Pourquoi ce test existe
 //!
-//! Le parent (Eddie) a fixé l'intention de la Task 6 : ajouter deux
+//! Le parent (l'opérateur) a fixé l'intention de la Task 6 : ajouter deux
 //! endpoints qui permettent à une inférence de (a) capturer le viewport
 //! d'un onglet et (b) détecter la présence d'un captcha sur la page.
 //! Comme pour les Tasks 3-4-5, on **enveloppe** `POST /v2/cmd` (déjà

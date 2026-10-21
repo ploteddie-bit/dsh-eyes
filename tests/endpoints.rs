@@ -3,7 +3,7 @@
 //!
 //! ## Pourquoi ce test existe
 //!
-//! Le parent (Eddie) a fixé l'intention de la Task 3 : donner aux
+//! Le parent (l'opérateur) a fixé l'intention de la Task 3 : donner aux
 //! inférences les **2 fondamentaux « ouvrir une page » et « lire le
 //! contenu »**. On ne duplique pas la logique du canal — on
 //! enveloppe `POST /v2/cmd` (déjà couvert par `tests/cmd.rs`) avec deux

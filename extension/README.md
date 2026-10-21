@@ -91,7 +91,7 @@ de contenu de page.
 - **Pas de capture de réponse** : on ne lit que les headers HTTP (`content-length`),
   jamais le corps. Les URLs ne sont pas envoyées ailleurs que sur le WS localhost.
 - **Pas d'allowlist dans l'extension** : toute requête HTTP(S) vue par Chrome
-  produit un événement. Si Eddie veut filtrer côté client, prochaine itération :
+  produit un événement. Si l'opérateur veut filtrer côté client, prochaine itération :
   `chrome.storage.local` + filtre dans `buildEvent()`.
 - **Service worker éphémère** : le contenu de la file FIFO est perdu à chaque
   réveil du worker (acceptable — c'est ce que dit le brief). Pour aller

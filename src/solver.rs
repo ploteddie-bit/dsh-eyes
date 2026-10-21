@@ -10,7 +10,7 @@
 //!
 //! ## Pourquoi deux tiers
 //!
-//! Eddie veut une résilience face aux pannes silencieuses d'Ollama
+//! L'opérateur veut une résilience face aux pannes silencieuses d'Ollama
 //! (réseau down, instance qui crash, modèle pas encore chargé en RAM).
 //! Le tier 1 est le chemin nominal (ia-general sur `10.0.0.223`) ; si
 //! il échoue (timeout, 5xx, JSON cassé), on tente le tier 2 (serveur-ia
@@ -22,7 +22,7 @@
 //!
 //! Pas de fallback GPU local (llama.cpp, etc.) dans cette itération. Le
 //! brief mentionne "ia-general → serveur-ia → humain". Un tier local
-//! serait une itération future (Eddie tranchera).
+//! serait une itération future (l'opérateur tranchera).
 //!
 //! ## Limites assumées
 //!

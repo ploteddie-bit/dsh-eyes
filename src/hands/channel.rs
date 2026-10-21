@@ -1,6 +1,6 @@
 //! Canal bidirectionnel démon ↔ extension Chrome (modèle WebBridge).
 //!
-//! ## Pourquoi (REWORK Eddie — modèle webbridge)
+//! ## Pourquoi (REWORK de l'opérateur — modèle webbridge)
 //!
 //! L'extension DSH Eyes, déjà chargée dans le navigateur de l'utilisateur
 //! (manifest MV3, service worker `background.js`), pousse des événements

@@ -447,7 +447,7 @@ async function cmdTabsCreate({ url, group_title }) {
   const titre = typeof group_title === "string" && group_title ? group_title : null;
 
   if (titre) {
-    // Réutilisation (retour Eddie) : un groupe = UN onglet de travail.
+    // Réutilisation (retour opérateur) : un groupe = UN onglet de travail.
     // Si un onglet du groupe existe déjà, on le navigue au lieu d'empiler
     // des onglets ; la fenêtre du groupe est ainsi réutilisée elle aussi.
     const groupes = await chrome.tabGroups.query({ title: titre });
@@ -468,7 +468,7 @@ async function cmdTabsCreate({ url, group_title }) {
     }
   }
 
-  // Déduplication (retour Eddie) : onglet identique déjà ouvert → focus
+  // Déduplication (retour opérateur) : onglet identique déjà ouvert → focus
   // au lieu de créer un doublon. Avec un groupe demandé, l'onglet trouvé
   // est adopté dans le groupe (migration propre au premier passage).
   const existing = await findTabByUrl(url);
@@ -693,7 +693,7 @@ const sleepNat = (ms) => new Promise((r) => setTimeout(r, ms));
  *  v0.6.0 : `focus` optionnel (défaut false) — amène AUSSI la fenêtre au
  *  premier plan de l'OS. Constat GA4 20/10 : les Input CDP gèlent quand la
  *  FENÊTRE entière est derrière une autre (rendu suspendu par Windows).
- *  Vol de focus explicite = sur demande seulement (Eddie travaille).
+ *  Vol de focus explicite = sur demande seulement (l'opérateur travaille).
  *  v0.6.1 : `timeout_ms` optionnel — plafond CDP par appel (défaut 8 s,
  *  borné 1-20 s) et garde du geste à +5 s (max 24 s, sous le plafond 25 s).
  *  Un `eval` multi-actions de 12 s n'est plus tué à 8 s. */

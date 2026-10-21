@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # capture-ecran.sh — capture l'ÉCRAN PHYSIQUE Windows (pas l'intérieur du
-# navigateur) avec le CURSEUR dessiné. Idée d'Eddie (20/10) : ne plus faire
+# navigateur) avec le CURSEUR dessiné. Idée de l'opérateur (20/10) : ne plus faire
 # confiance à Chromium (captureVisibleTab mentait : images en cache) et voir
 # la VÉRITÉ : fenêtre au premier plan, focus, position réelle du pointeur,
 # bandeau debugger.
@@ -8,13 +8,13 @@
 # Options :
 #   --region x,y,w,h    capture une zone précise (pixels écran)
 #   --fenetre [titre]   capture une fenêtre (titre partiel) ; sans titre = fenêtre active
-#   --out <chemin>      fichier de sortie Windows (défaut : C:\Users\eddie\Downloads\ecran-dsh.png)
+#   --out <chemin>      fichier de sortie Windows (défaut : %USERPROFILE%\Downloads\ecran-dsh.png)
 #
 # Sortie : "OK LARGEURxHAUTEUR mode curseur@(x,y)" puis le chemin WSL.
 set -eu
 PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 
-OUT='C:\Users\eddie\Downloads\ecran-dsh.png'
+OUT='%USERPROFILE%\Downloads\ecran-dsh.png'
 REGION=''
 TITRE=''
 FENETRE=0
@@ -66,7 +66,7 @@ public class U32X {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
 }
 "@
-  $out = $env:DSH_OUT
+  $out = [Environment]::ExpandEnvironmentVariables($env:DSH_OUT)
   $titre = $env:DSH_TITRE
   $fenetre = [int]$env:DSH_FENETRE
   $rx = [int]$env:DSH_RX; $ry = [int]$env:DSH_RY

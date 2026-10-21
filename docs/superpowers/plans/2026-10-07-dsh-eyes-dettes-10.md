@@ -48,7 +48,7 @@
 
 ### Lot D — D6 + D7 : captcha appliqué + crop (extension/background.js)
 
-**Files:** Modify `extension/background.js` uniquement. **Tests:** manuels (Eddie) + syntaxe node.
+**Files:** Modify `extension/background.js` uniquement. **Tests:** manuels (par l'opérateur) + syntaxe node.
 
 - [ ] **D7 crop** : `cmdCaptchaDetect` — au lieu de la capture plein écran, injecter un script qui croppe l'élément captcha via `captureVisibleTab` + canvas off-screen (drawImage du rect getBoundingClientRect) → `image_b64` = crop de l'élément.
 - [ ] **D6 grille** : nouvelle commande `captcha_apply_grid` `{tab_id, tile_indexes:[1,3]}` : cliquer les tuiles (sélecteurs calculés depuis la grille), puis le bouton verify — pour hCaptcha/reCAPTCHA image.

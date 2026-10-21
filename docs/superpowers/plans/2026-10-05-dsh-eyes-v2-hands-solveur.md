@@ -15,10 +15,10 @@
 - **Navigation sortante uniquement** : `/open` et `/goto` refusent localhost, 127.0.0.0/8, ::1, 10/8, 192.168/16, 172.16/12 (réutilisation de la logique IP de `vigil.rs`, mutualisée). La page ouverte peut *afficher* du contenu, mais le démon ne pilote pas de navigation *vers* le réseau interne.
 - **Chaque action est journalisée** dans `~/.dsh-eyes/actions.jsonl` : `{ts, action, url, page_id, result}`.
 - Captchas : **détection + résolution image/locale uniquement**. Pas de service tiers (2captcha etc.). Échec après N tentatives → `{"status":"human_required"}`. reCAPTCHA v3 (score invisible) = hors capacité, retourné `unsupported`.
-- Instance Chrome dédiée : user-data-dir `~/.dsh-eyes/chrome-profile`, JAMAIS le profil d'Eddie. Le démon la lance avec `--remote-debugging-port=<port libre>` et `--headless=new` (option `--headless=false` configurable).
-- Résolution de captcha = lecture d'image → **l'inférence vision tourne sur les serveurs Ollama d'Eddie** (ia-general puis serveur-ia). Zéro service tiers, zéro clé.
+- Instance Chrome dédiée : user-data-dir `~/.dsh-eyes/chrome-profile`, JAMAIS le profil de l'opérateur. Le démon la lance avec `--remote-debugging-port=<port libre>` et `--headless=new` (option `--headless=false` configurable).
+- Résolution de captcha = lecture d'image → **l'inférence vision tourne sur les serveurs Ollama de l'opérateur** (ia-general puis serveur-ia). Zéro service tiers, zéro clé.
 - Cibles : ia-general `http://10.0.0.223:11434`, serveur-ia `http://10.0.0.245:11434` (MESURÉ actifs ; serveur-ia : 13 Go RAM dispo, load 0,00).
-- Repo : `Edy:~/projets/dsh-eyes/`, branche main (base v1 = `5daa49a`).
+- Repo : `~/projets/dsh-eyes/`, branche main (base v1 = `5daa49a`).
 
 ---
 
@@ -129,11 +129,11 @@
 
 ### Task 8: Skill `dsh-eyes-agent` + doc API pour toutes les inférences
 
-**Files:** Create `Edy:~/.dsh/skills/dsh-eyes-agent/SKILL.md`, Modify `Edy:~/.dsh/docs/ecosysteme-local.md`
+**Files:** Create `~/.dsh/skills/dsh-eyes-agent/SKILL.md`, Modify `~/.dsh/docs/ecosysteme-local.md`
 
 - [ ] **Step 1:** SKILL.md : objectif, prérequis (démon lancé, token), les 8 endpoints v2 avec exemples curl complets, les garde-fous, la sémantique captcha (human_required = ne pas insister), la règle « toute action est journalisée ».
 - [ ] **Step 2:** Inventaire : §5 DSH Eyes enrichie (API v2, token, instance Chrome dédiée).
-- [ ] **Step 3:** Commit + vérification qu'une session fictive peut suivre le skill (relecture à froid par Eddie ou un subagent).
+- [ ] **Step 3:** Commit + vérification qu'une session fictive peut suivre le skill (relecture à froid par l'opérateur ou un subagent).
 
 ---
 
@@ -143,7 +143,7 @@
 
 - [ ] **Step 1:** Scénario complet authentifié : démon + navigateur → `/open` une page de démo de formulaire publique (site de démo type httpbin forms ou page data: riche) → `/text` (lire) → `/fill` + `/click` (soumettre) → `/captcha` (détection none) → screenshot. Preuves curl complètes dans le rapport.
 - [ ] **Step 2:** Scénario captcha : page de démo reCAPTCHA → `/captcha` détecte → `/solve` → verdict (solved OU human_required) documenté honnêtement.
-- [ ] **Step 3:** Eddie valide le comportement (inspection des captures + logs).
+- [ ] **Step 3:** L'opérateur valide le comportement (inspection des captures + logs).
 - [ ] **Step 4:** Revue finale de branche (subagent, grille sécurité : token obligatoire, garde-fous, pas de fuite de contenu, zéro unwrap async) + commit docs.
 - [ ] **Step 5:** Inventaire + cockpit mis à jour en « déployé v2 ».
 

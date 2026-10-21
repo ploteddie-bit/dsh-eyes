@@ -3,7 +3,7 @@
 //!
 //! ## Pourquoi ce test existe
 //!
-//! Le parent (Eddie) a fixé l'intention de la Task 4 : donner aux
+//! Le parent (l'opérateur) a fixé l'intention de la Task 4 : donner aux
 //! inférences les **4 actions de manipulation** de page (navigation,
 //! click, fill, wait for selector) sous forme d'endpoints de commodité.
 //! Même philosophie que `tests/endpoints.rs` : on **enveloppe** `POST

@@ -4,7 +4,7 @@
 //!
 //! Le brief REWORK 2026-10-05 demande une **preuve automatisée** du
 //! cycle complet `démion → commande → extension → réponse`, sans
-//! dépendre du vrai Chrome d'Eddie (celui-ci est trop lourd à
+//! dépendre du vrai Chrome de l'opérateur (celui-ci est trop lourd à
 //! recharger pour chaque test). On utilise donc une **fausse extension**
 //! — un client WS qui parle le même protocole que `background.js` et
 //! qui répond aux commandes.

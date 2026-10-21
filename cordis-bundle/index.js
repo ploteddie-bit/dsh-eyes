@@ -96,7 +96,7 @@ export function apply(ctx, _config) {
 	ctx.tools.register(
 		tool(
 			"dsh_eyes_open",
-			"DSH Eyes — ouvre une URL dans un nouvel onglet du navigateur d'Eddie (trajectoire humaine simulée). Navigation sortante uniquement : localhost et réseaux privés refusés (403).",
+			"DSH Eyes — ouvre une URL dans un nouvel onglet du navigateur de l'opérateur (trajectoire humaine simulée). Navigation sortante uniquement : localhost et réseaux privés refusés (403).",
 			{ url: str("URL http(s) à ouvrir.") },
 			["url"],
 			async (args) => api("/v2/open", "POST", { url: args.url }),
@@ -159,7 +159,7 @@ export function apply(ctx, _config) {
 	ctx.tools.register(
 		tool(
 			"dsh_eyes_solve",
-			"DSH Eyes — détecte et résout un captcha localement (qwen2.5-vl sur les Ollama d'Eddie : ia-general RX 9060 XT → serveur-ia iGPU → humain). human_required = ne pas insister, unsupported = reCAPTCHA v3.",
+			"DSH Eyes — détecte et résout un captcha localement (qwen2.5-vl sur les instances Ollama de l'opérateur : ia-general RX 9060 XT → serveur-ia iGPU → humain). human_required = ne pas insister, unsupported = reCAPTCHA v3.",
 			{ tab_id: num("ID de l'onglet cible.") },
 			[],
 			async (args) =>
