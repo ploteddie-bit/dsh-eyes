@@ -233,6 +233,7 @@
     <li><b>Métriques (phase 4, première brique)</b> : <code>GET /v2/metrics</code> expose volumes, issues, latence globale et par commande.</li>
     <li><b>Act batch (phase 2, première brique)</b> : <code>POST /v2/act</code> + <code>POST /v2/act/cancel</code>, <code>action_id</code> mémorisé 5 min, propagation du <code>tab_id</code> ; idempotence et annulation coopérative validées live.</li>
     <li><b>Rate limit (phase 4)</b> : token bucket global 120 commandes/min (rafale 60) dans <code>send_cmd</code> ; au-delà <code>429 rate_limited</code> ; test live 80 requêtes → 60×200, 20×429, refill OK après 1,2 s.</li>
+    <li><b>E2E automatisé (phase 5)</b> : <code>scripts/e2e.py</code>, 17 contrôles PASS (health, auth, SSRF, tabs_create, read, screenshot, eval, fill, type_native, act cache/annulation, métriques, click_native_text vérifié) ; multi-frame en attente du rechargement.</li>
     <li><b>Tests</b> : 141 passés, 2 ignorés ; nouveaux tests SSRF <code>/v2/cmd</code>, backslash, WS 401, rédaction, sérialisation par onglet, métriques, act batch, rate limit, ping/pong.</li>
     <li><b>CI GitHub Actions (phase 5)</b> : run <code>39673427865</code> vert — Node (syntaxe + <code>npm ci</code>) et Rust (tests, clippy, build musl) ; correctif <code>clippy::result_large_err</code> pour Rust 1.99.</li>
     <li><b>Surveillance CLOSE-WAIT (phase 5)</b> : timer user toutes les 5 min, journal <code>~/.dsh-eyes/close-wait.log</code>, échec si CLOSE-WAIT &gt; 0 ; baseline <code>close_wait=0, estab=1</code> à 22:59.</li>

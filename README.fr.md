@@ -118,6 +118,11 @@ Commandes supportées (cf. `extension/background.js`) :
 - `screen_pos {tab_id?, selector}` — active l'onglet et renvoie la géométrie **écran** de l'élément (`ecranX/ecranY`) — à passer à `bin/os-clic.sh` qui déplace le **VRAI pointeur Windows** (SetCursorPos + mouse_event via interop WSL→PowerShell). Contrôle exclusif du pointeur pendant ~300 ms ; offsets de calibrage `OS_OFFSET_X/Y` si zoom/DPI atypique.
 - `wait_for {tab_id?, selector|text, timeout_ms?}` — attente polluante bornée (250 ms, max 60 s) d'un sélecteur OU d'un texte : remplace les sleep arbitraires des scripts sur SPA lentes.
 
+> Les trois commandes de clic natif (`click_native`, `click_native_text`,
+> `click_native_rect`) acceptent `focus:true` : la fenêtre Chrome est amenée
+> au premier plan. Nécessaire si elle est minimisée ou occultée, sinon CDP
+> Input peut geler jusqu'au garde de 15 s.
+
 Note v1.0.0 (changements introduits en 0.6.1, désormais figés dans la version majeure) :
 - Les commandes sont **sérialisées par onglet** (`tab_id`) : deux appels concurrents sur le même onglet ne se percutent plus sur `chrome.debugger.attach`.
 - `eval` accepte `timeout_ms` (défaut 8000, borné 1000-20000 ms) ; le garde du geste suit à +5 s (max 24 s).
@@ -256,6 +261,17 @@ kill $DAEMON_PID
 ## Vue d'ensemble (inventaire)
 
 Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
+
+## E2E automatisé
+
+```bash
+scripts/e2e.py               # contrôles standards
+scripts/e2e.py --multiframe  # + shadow DOM / iframe same-origin
+```
+
+Le script vérifie `/health`, `/v2/info`, le handshake, le SSRF, `tabs_create`,
+`read`, `screenshot`, `eval`, `fill`, `type_native`, `act` (cache + annulation),
+les métriques et `click_native_text`. Il sort en code 1 au premier échec.
 
 ## Limites connues (v1.1.0)
 
