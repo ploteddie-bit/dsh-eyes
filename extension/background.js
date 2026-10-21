@@ -22,7 +22,7 @@
 const WS_URL = "ws://127.0.0.1:8445/ws";
 
 // v2.1 — couche de comportement humain (port ghost-cursor).
-import { humanMousePath, humanTypingPlan, humanScrollPlan } from "./humanize-math.js";
+import { humanMousePath, humanTypingPlan, humanScrollPlan, humanProfile } from "./humanize-math.js";
 
 // Dernière position de curseur connue par onglet (les injections de
 // trajectoire démarrent d'ici — jamais du même point deux fois de suite).
@@ -166,7 +166,7 @@ async function connect() {
             "click_native", "click_native_text", "click_native_rect",
             "type_native", "scroll_native", "screen_pos",
             "screenshot", "captcha_detect", "record",
-            "multiframe", "shadow_dom", "heartbeat",
+            "multiframe", "shadow_dom", "heartbeat", "human_profiles",
           ],
         },
       }));
@@ -907,9 +907,9 @@ function fractionGaussienne(lo = 0.2, hi = 0.8) {
  *  humanMousePath — part du dernier point connu, jamais de téléportation.
  *  Les gestes CDP héritent ainsi de la même humanisation que les gestes JS,
  *  au lieu d'une interpolation linéaire en 3-8 points. */
-async function deplacerCurseur(dbg, tabId, cible) {
+async function deplacerCurseur(dbg, tabId, cible, jitter = 24) {
   const dep = nativeCursor.get(tabId) || { x: 8, y: Math.round(120 + Math.random() * 240) };
-  const { points } = humanMousePath(dep, cible, { jitter: 24 });
+  const { points } = humanMousePath(dep, cible, { jitter });
   for (const p of points) {
     await dbg("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
     await sleepNat(p.delayMs);
@@ -972,7 +972,7 @@ async function lireRect(id, selector) {
 
 /** Clic natif : trajectoire + hésitation + press/release (isTrusted=true).
  *  v0.6.1 : passe par le cœur partagé pour bénéficier de l'accusé vérifié. */
-async function cmdClickNative({ tab_id, selector, focus }) {
+async function cmdClickNative({ tab_id, selector, focus, human_profile }) {
   if (typeof selector !== "string" || !selector) {
     throw new Error("click_native: 'selector' (string) requis");
   }
@@ -981,7 +981,7 @@ async function cmdClickNative({ tab_id, selector, focus }) {
   if (!rect) throw new Error("click_native: sélecteur introuvable: " + selector);
   if (!rect.visible) throw new Error("click_native: élément hors viewport (scroll_native d'abord)");
   if (rect.cross_origin) throw new Error("click_native: élément dans une iframe cross-origin (non supporté)");
-  return clicNatifSurRect(id, rect, selector, focus);
+  return clicNatifSurRect(id, rect, selector, focus, human_profile);
 }
 
 /** virtual-keycode minimal : lettres/chiffres/Espace/Entrée (reste → 0). */
@@ -999,7 +999,7 @@ function vkDe(ch) {
  *  humain (délais lognormaux, typos, backspace) — jamais keyboard.press.
  *  `timeout_ms` optionnel : budget du geste (défaut calculé sur la
  *  longueur du texte, borné à 24 s par withDebugger). */
-async function cmdTypeNative({ tab_id, selector, text, submit, timeout_ms }) {
+async function cmdTypeNative({ tab_id, selector, text, submit, timeout_ms, human_profile }) {
   if (typeof text !== "string") throw new Error("type_native: 'text' (string) requis");
   const id = await resolveTabId(tab_id);
   if (selector) {
@@ -1026,7 +1026,8 @@ async function cmdTypeNative({ tab_id, selector, text, submit, timeout_ms }) {
     // Plan de frappe humain : délais lognormaux, typos QWERTY (~3 %) et
     // corrections backspace. Les gestes CDP ne sont plus une frappe
     // mécanique à dwell fixe.
-    const plan = humanTypingPlan(text);
+    const profile = humanProfile(human_profile);
+    const plan = humanTypingPlan(text, { typoRate: profile.typoRate });
     for (const step of plan) {
       if (step.type === "backspace") {
         await dbg("Input.dispatchKeyEvent", {
@@ -1159,24 +1160,24 @@ async function chercherRectTexte(id, texte, exact) {
 
 /** Clic natif sur un élément repéré PAR TEXTE (GA4/Angular : pas de
  *  sélecteur stable, mais un libellé). Préfixe par défaut, exact:true sinon. */
-async function cmdClickNativeText({ tab_id, text, exact, focus }) {
+async function cmdClickNativeText({ tab_id, text, exact, focus, human_profile }) {
   if (typeof text !== "string" || !text) throw new Error("click_native_text: 'text' requis");
   const id = await resolveTabId(tab_id);
   const rect = await chercherRectTexte(id, text, exact);
   if (!rect) throw new Error("click_native_text: aucun élément portant le texte: " + text);
   if (rect.introuvable) throw new Error("click_native_text: élément « " + text + " » hors viewport (scroll_native d'abord)");
   if (rect.cross_origin) throw new Error("click_native_text: élément dans une iframe cross-origin (non supporté)");
-  return clicNatifSurRect(id, rect, JSON.stringify(text), focus);
+  return clicNatifSurRect(id, rect, JSON.stringify(text), focus, human_profile);
 }
 
 /** Clic natif à des coordonnées viewport BRUTES — brique universelle :
  *  eval cherche par n'importe quelle logique, ce clic exécute. */
-async function cmdClickNativeRect({ tab_id, x, y, focus }) {
+async function cmdClickNativeRect({ tab_id, x, y, focus, human_profile }) {
   const px = Math.round(Number(x));
   const py = Math.round(Number(y));
   if (!Number.isFinite(px) || !Number.isFinite(py)) throw new Error("click_native_rect: 'x'/'y' requis");
   const id = await resolveTabId(tab_id);
-  return clicNatifSurRect(id, { x: px, y: py, w: 0, h: 0 }, px + "," + py, focus);
+  return clicNatifSurRect(id, { x: px, y: py, w: 0, h: 0 }, px + "," + py, focus, human_profile);
 }
 
 /** Cœur partagé des clics natifs : gaussienne dans le rect (si surface),
@@ -1184,14 +1185,15 @@ async function cmdClickNativeRect({ tab_id, x, y, focus }) {
  *  v0.6.1 : accusé VÉRIFIÉ — l'état de page (URL, scroll, DOM, focus,
  *  aria-*) est capturé avant/après. `verified` dit si un effet a été
  *  observé, ce qui permet au client de ne pas rejouer un clic à l'aveugle. */
-async function clicNatifSurRect(id, rect, libelle, focus) {
+async function clicNatifSurRect(id, rect, libelle, focus, human_profile) {
+  const profile = humanProfile(human_profile);
   const cible = {
     x: Math.round(rect.x + (rect.w > 8 ? rect.w * fractionGaussienne() : 0)),
     y: Math.round(rect.y + (rect.h > 8 ? rect.h * fractionGaussienne() : 0)),
   };
   const avant = await lireEtatPage(id);
   const rep = await withDebugger(id, async (dbg) => {
-    await deplacerCurseur(dbg, id, cible);
+    await deplacerCurseur(dbg, id, cible, profile.jitter);
     await sleepNat(40 + Math.random() * 60);
     await dbg("Input.dispatchMouseEvent", { type: "mousePressed", x: cible.x, y: cible.y, button: "left", clickCount: 1 });
     await sleepNat(45 + Math.random() * 50);

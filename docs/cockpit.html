@@ -132,6 +132,7 @@ const COCKPIT={
     {n:'Surveillance CLOSE-WAIT 24 h',c:'timer 5 min ; baseline close_wait=0 estab=1 à 22:59 ; journal close-wait.log ; Linger=yes',cmds:['systemctl --user list-timers dsh-eyes-closewait.timer','tail -3 ~/.dsh-eyes/close-wait.log']},
     {n:'Rate limit 120/min (phase 4)',c:'token bucket global burst 60 ; 80 requêtes live → 60×200, 20×429 ; refill OK après 1,2 s',cmds:['curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" http://127.0.0.1:8445/v2/metrics']},
     {n:'E2E automatisé scripts/e2e.py',c:'17 contrôles PASS ; click_native_text verified avec focus:true ; multi-frame en attente du rechargement',cmds:['scripts/e2e.py']},
+    {n:'Profils humains calme/normal/presse (phase 3)',c:'human_profile : jitter 40/24/12 px, typos 5/3/1,5 % ; deploye, validation apres rechargement',cmds:['scripts/e2e.py']},
   ],
   regles:[
     'Preuve brute obligatoire : « ça devrait marcher » est interdit.',

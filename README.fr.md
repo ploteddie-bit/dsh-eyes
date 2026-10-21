@@ -122,6 +122,10 @@ Commandes supportées (cf. `extension/background.js`) :
 > `click_native_rect`) acceptent `focus:true` : la fenêtre Chrome est amenée
 > au premier plan. Nécessaire si elle est minimisée ou occultée, sinon CDP
 > Input peut geler jusqu'au garde de 15 s.
+>
+> Les gestes natifs acceptent aussi `human_profile` : `calme` (jitter 40,
+> typos 5 %), `normal` (24, 3 %), `presse` (12, 1,5 %). Le profil module la
+> trajectoire souris et la frappe ; `normal` par défaut.
 
 Note v1.0.0 (changements introduits en 0.6.1, désormais figés dans la version majeure) :
 - Les commandes sont **sérialisées par onglet** (`tab_id`) : deux appels concurrents sur le même onglet ne se percutent plus sur `chrome.debugger.attach`.

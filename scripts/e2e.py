@@ -181,7 +181,7 @@ def main() -> int:
             st, r = cmd("eval", {"tab_id": tab, "code": "() => window.__frameClicked === true"})
             check("marqueur iframe", st == 200 and r.get("result", {}).get("value") is True, str(r))
 
-    st, r = cmd("click_native_text", {"tab_id": tab, "text": "Learn more", "focus": True})
+    st, r = cmd("click_native_text", {"tab_id": tab, "text": "Learn more", "focus": True, "human_profile": "presse"})
     check("click_native_text verified", st == 200 and (r.get("result") or {}).get("verified") is True, str(r.get("error", "")))
 
     print()

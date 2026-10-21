@@ -21,6 +21,22 @@ export function gauss(mean = 0, stdDev = 1) {
 	return mean + stdDev * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
+/**
+ * Profils de navigation humaine. `jitter` = amplitude du bruit sur les
+ * points de contrôle souris (px) ; `typoRate` = probabilité de typo par
+ * caractère (plafonnée à 0,08 par humanTypingPlan).
+ */
+export const HUMAN_PROFILES = {
+	calme: { jitter: 40, typoRate: 0.05 },
+	normal: { jitter: 24, typoRate: 0.03 },
+	presse: { jitter: 12, typoRate: 0.015 },
+};
+
+/** Retourne le profil demandé, ou `normal` si le nom est inconnu. */
+export function humanProfile(name) {
+	return HUMAN_PROFILES[name] || HUMAN_PROFILES.normal;
+}
+
 /** Point sur une courbe de Bézier cubique à t ∈ [0,1]. */
 export function cubicBezier(p0, c1, c2, p1, t) {
 	const it = 1 - t;
