@@ -126,6 +126,7 @@ const COCKPIT={
     {n:'Enregistrement d\'écran — routes /v2/record/*',c:'start → stop produit un MP4 h264 lisible (ffprobe : durée, fps, résolution) ; venv-rec avec mss/opencv/imageio/imageio-ffmpeg/numpy',cmds:['curl -s -X POST -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" -H "Content-Type: application/json" -d \'{"out":"%USERPROFILE%\\\\Videos\\\\dsh-test.mp4","duration":3,"fps":10,"resolution":"480p"}\' http://127.0.0.1:8445/v2/record/start']},
     {n:'Audit 21/10 — 5 quick wins (WS auth, fuite FDs, SSRF, tabs_create, MCP)',c:'ws authentifie + handshake ; 0 CLOSE-WAIT sur 24 h ; /v2/cmd refuse localhost ; tabs_create navigue ; dsh_ping reel ; humanize branche sur CDP',cmds:['ss -tn | grep 8445','curl -s http://127.0.0.1:8445/health']},
     {n:'Phase 0 — validée live (1.1.0)',c:'/health 1.1.0 ; /v2/info extension connectée + hello 1.1.0 ; 0 CLOSE-WAIT ; SSRF 403/400 ; E2E read/fill/type_native/click_native verified ; actions.jsonl redacted',cmds:['curl -s http://127.0.0.1:8445/health']},
+    {n:'Métriques /v2/metrics (phase 4 — première brique)',c:'volumes, issues, latence globale et par commande ; total=1/ok=1/372 ms validé live ; test unitaire metrics_comptent_ok_et_timeout',cmds:['curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" http://127.0.0.1:8445/v2/metrics']},
   ],
   regles:[
     'Preuve brute obligatoire : « ça devrait marcher » est interdit.',
