@@ -26,7 +26,7 @@ Chrome — it talks to the extension over the same WS `ws://127.0.0.1:8445/ws`,
 now **bidirectional**.
 
 The CDP spawn + `chromiumoxide` model has been **abandoned** in favour of
-this webbridge model. See `Edy:~/.superpowers/sdd/2026-10-05-dsh-eyes-v2-hands-solveur/task-2-report.md`
+this webbridge model. See `~/.superpowers/sdd/2026-10-05-dsh-eyes-v2-hands-solveur/task-2-report.md`
 (REWORK section) for the details.
 
 ## Routes v2 — `POST /v2/cmd`
@@ -85,7 +85,7 @@ Three routes protected by the token:
 - `POST /v2/record/stop` — creates the sentinel file, waits for the CLI and returns its JSON (`frames`, `duration_s`, `fps`, `resolution`).
 - `GET /v2/record/status` — `{recording, out?, elapsed_s?}`.
 
-The CLI lives in `bin/rec_ecran_cli.py` (source) and `C:\Users\eddie\Documents\Mon Enregistreur\rec_ecran_cli.py` (Windows deployment). Dependencies: `mss`, `opencv-python`, `imageio`, `imageio-ffmpeg`, `numpy` in `venv-rec`.
+The CLI lives in `bin/rec_ecran_cli.py` (source) and `%USERPROFILE%\Documents\Mon Enregistreur\rec_ecran_cli.py` (Windows deployment). Dependencies: `mss`, `opencv-python`, `imageio`, `imageio-ffmpeg`, `numpy` in `venv-rec`.
 
 ### Screen capture (v1.0.0)
 
@@ -93,7 +93,7 @@ The CLI lives in `bin/rec_ecran_cli.py` (source) and `C:\Users\eddie\Documents\M
 
 - `--region x,y,w,h` — a specific area (e.g. `0,0,800,600`).
 - `--fenetre [title]` — a window by partial title (e.g. `"Chrome"`); without a title, the active window.
-- `--out <path>` — Windows output file (default `C:\Users\eddie\Downloads\ecran-dsh.png`).
+- `--out <path>` — Windows output file (default `%USERPROFILE%\Downloads\ecran-dsh.png`).
 
 Output: `OK WIDTHxHEIGHT cursor mode@(x,y)` then the WSL path. The crop reduces the loss of detail caused by the model's image downscaling.
 
@@ -104,7 +104,7 @@ Derived from new-pmu (rules 9-10 of 2026-10-12, measured in live A/B):
 — identifiable by the platforms that watch for them (eBay finding
 2026-10-20: anti-bot triggered by JS clicks). The `_native` commands emit
 real input events. **Use restricted to OUR consoles and OUR accounts**
-(GA4, GSC, Bing, Eddie's Chrome) — never to circumvent terms of service or on
+(GA4, GSC, Bing, the operator's Chrome) — never to circumvent terms of service or on
 accounts in dispute (suspended eBay = by hand).
 
 ## Static build (musl)
@@ -194,7 +194,7 @@ kill $DAEMON_PID
 
 ## Overview (inventory)
 
-See `Edy:~/.dsh/docs/ecosysteme-local.md` ("DSH Eyes" section).
+See `~/.dsh/docs/ecosysteme-local.md` ("DSH Eyes" section).
 
 ## Known limitations (v1.0.0)
 
@@ -202,3 +202,7 @@ See `Edy:~/.dsh/docs/ecosysteme-local.md` ("DSH Eyes" section).
 - **Audio**: `rec_ecran_cli.py` captures video only; the microphone and the original application's system audio are not integrated.
 - **Daemon security**: `/v2/cmd` does not re-apply `is_forbidden_host` (local SSRF bypass possible); `/ws` does not require the token; no rate limit; no version handshake between the extension and the daemon.
 - **Ignored doc-test**: `src/vigil.rs:283` is an ` ```ignore ` example, not executed — it does not count as a test.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
