@@ -128,6 +128,7 @@ const COCKPIT={
     {n:'Phase 0 — validée live (1.1.0)',c:'/health 1.1.0 ; /v2/info extension connectée + hello 1.1.0 ; 0 CLOSE-WAIT ; SSRF 403/400 ; E2E read/fill/type_native/click_native verified ; actions.jsonl redacted',cmds:['curl -s http://127.0.0.1:8445/health']},
     {n:'Métriques /v2/metrics (phase 4 — première brique)',c:'volumes, issues, latence globale et par commande ; total=1/ok=1/372 ms validé live ; test unitaire metrics_comptent_ok_et_timeout',cmds:['curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" http://127.0.0.1:8445/v2/metrics']},
     {n:'Act batch idempotent + annulation (phase 2)',c:'POST /v2/act : 2 étapes, cached:true au 2e appel, annulation 409 cancelled step=1 results=1 ; propagation tab_id',cmds:['curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" http://127.0.0.1:8445/v2/metrics']},
+    {n:'CI GitHub Actions verte (run 39673427865)',c:'Node + Rust tests/clippy/musl verts ; GitHub main = 9f88b70 ; clippy result_large_err corrige pour Rust 1.99',cmds:['gh run view 39673427865 -R ploteddie-bit/dsh-eyes']},
   ],
   regles:[
     'Preuve brute obligatoire : « ça devrait marcher » est interdit.',
