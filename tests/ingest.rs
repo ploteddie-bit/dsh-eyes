@@ -256,3 +256,47 @@ fn tempdir_in_tests_target() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("create tests-tmp dir");
     dir
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ws_ping_repond_pong() {
+    let _guard = common::env_guard();
+    let tmp = tempdir_in_tests_target();
+    std::env::set_var("DSH_EYES_HOME", &tmp);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = dsh_eyes::api::router(
+        dsh_eyes::state::VigilCtx::new(),
+        ExtensionChannel::new(),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("axum serve");
+    });
+
+    let url = format!("ws://{}/ws", addr);
+    let (stream, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect_async WS");
+    let (mut ws_tx, mut ws_rx) = stream.split();
+
+    ws_tx
+        .send(Message::Text(r#"{"ping":123}"#.to_string()))
+        .await
+        .expect("send ping");
+
+    let reply = tokio::time::timeout(TEST_TIMEOUT, ws_rx.next())
+        .await
+        .expect("réponse dans le délai")
+        .expect("stream non vide")
+        .expect("message WS");
+    let text = match reply {
+        Message::Text(t) => t.to_string(),
+        other => panic!("réponse inattendue: {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(v["pong"], 123);
+
+    let _ = ws_tx.send(Message::Close(None)).await;
+    server.abort();
+}

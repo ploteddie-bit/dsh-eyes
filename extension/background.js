@@ -43,6 +43,8 @@ let backoff = BACKOFF_MIN_MS;
 let reconnectTimer = null;
 let connecting = false;
 let closedByWorker = false;
+// Dernier pong applicatif reçu (heartbeat ping/pong, détection socket morte).
+let lastPong = 0;
 
 // Le token vit dans chrome.storage.local (clé `dsh_token`). Quand
 // l'utilisateur le modifie dans les options, on force une reconnexion
@@ -164,12 +166,18 @@ async function connect() {
             "click_native", "click_native_text", "click_native_rect",
             "type_native", "scroll_native", "screen_pos",
             "screenshot", "captcha_detect", "record",
-            "multiframe", "shadow_dom",
+            "multiframe", "shadow_dom", "heartbeat",
           ],
         },
       }));
     } catch (e) {
       log("hello: envoi impossible :", e && e.message);
+    }
+    lastPong = Date.now();
+    try {
+      ws.send(JSON.stringify({ ping: Date.now() }));
+    } catch (_) {
+      // La reconnexion est pilotée par l'événement close.
     }
     drainQueue();
     // Keep-alive (REWORK v2.1) : alarme 25 s — réveille le worker AVANT
@@ -185,6 +193,11 @@ async function connect() {
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name !== "dsh-eyes-keepalive") return;
       if (ws && ws.readyState === WebSocket.OPEN) {
+        if (Date.now() - lastPong > 70000) {
+          log("keep-alive : pas de pong depuis 70 s, reconnexion");
+          try { ws.close(); } catch (_) { /* déjà fermée */ }
+          return;
+        }
         try {
           ws.send(JSON.stringify({ ping: Date.now() }));
         } catch (e) {
@@ -204,6 +217,12 @@ async function connect() {
       payload = JSON.parse(ev.data);
     } catch (_) { /* message non-JSON, on ignore */ }
     if (!payload) return;
+
+    // Pong du heartbeat applicatif : la socket est vivante.
+    if (typeof payload.pong === "number") {
+      lastPong = Date.now();
+      return;
+    }
 
     // Commande du démon (REWORK 2026-10-05 — modèle webbridge).
     // Forme : {"cmd_id":N,"cmd":"goto"|"click"|"read"|"fill"|"tabs_create", "params":{...}}

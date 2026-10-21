@@ -68,6 +68,12 @@ struct HelloEnvelope {
     hello: HelloInfo,
 }
 
+/// Keep-alive applicatif : `{"ping": <ts>}` → réponse `{"pong": <ts>}`.
+#[derive(Debug, Deserialize)]
+struct PingEnvelope {
+    ping: u64,
+}
+
 /// Format d'un événement de navigation reçu sur WS.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -415,6 +421,17 @@ async fn handle_socket(socket: WebSocket, ctx: VigilCtx, channel: ExtensionChann
                     );
                     channel.set_hello(hello).await;
                     if !send_text(&local_tx, Ack::ok()) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Keep-alive applicatif : réponse immédiate, sans passer
+                // par le parse NavEvent (sinon le démon logguait une
+                // erreur "parse" toutes les 25 s).
+                if let Ok(PingEnvelope { ping }) = serde_json::from_str::<PingEnvelope>(&raw) {
+                    let pong = serde_json::json!({ "pong": ping }).to_string();
+                    if !send_text(&local_tx, pong) {
                         break;
                     }
                     continue;
