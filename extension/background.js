@@ -166,7 +166,7 @@ async function connect() {
             "click_native", "click_native_text", "click_native_rect",
             "type_native", "scroll_native", "screen_pos",
             "screenshot", "captcha_detect", "record",
-            "multiframe", "shadow_dom", "heartbeat", "human_profiles",
+            "multiframe", "shadow_dom", "heartbeat", "human_profiles", "allframes_target",
           ],
         },
       }));
@@ -656,8 +656,7 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
       return out.slice(0, 250);
     };
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab_id },
-      allFrames: true,
+      target: { tabId: tab_id, allFrames: true },
       func: injection,
     });
     const elements = [];
@@ -679,8 +678,7 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
     return full.slice(0, cap) + "\n[…tronqué à " + cap + " octets]";
   };
   const results = await chrome.scripting.executeScript({
-    target: { tabId: tab_id },
-    allFrames: true,
+    target: { tabId: tab_id, allFrames: true },
     func: injection,
     args: [cap],
   });
@@ -743,8 +741,7 @@ async function cmdFind({ tab_id, text, selector, limit }) {
     return out;
   };
   const results = await chrome.scripting.executeScript({
-    target: { tabId: id },
-    allFrames: true,
+    target: { tabId: id, allFrames: true },
     func: injection,
     args: [typeof text === "string" ? text : "", typeof selector === "string" ? selector : "", max],
   });
@@ -923,8 +920,7 @@ async function deplacerCurseur(dbg, tabId, cible, jitter = 24) {
  *  top-level utilisables par Input.dispatchMouseEvent. */
 async function lireRect(id, selector) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId: id },
-    allFrames: true,
+    target: { tabId: id, allFrames: true },
     func: (sel) => {
       const deepAll = (s) => {
         const out = [];
@@ -1107,8 +1103,7 @@ async function cmdScrollNative({ tab_id, dy }) {
  *  ajouté pour un clic natif top-level. */
 async function chercherRectTexte(id, texte, exact) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId: id },
-    allFrames: true,
+    target: { tabId: id, allFrames: true },
     func: (txt, ex) => {
       const normaliser = (s) => (s || "").replace(/\s+/g, " ").trim();
       const deepAll = (s) => {

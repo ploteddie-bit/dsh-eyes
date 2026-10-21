@@ -171,12 +171,12 @@ def main() -> int:
             st, r = cmd("find", {"tab_id": tab, "text": "Shadow"})
             check("find shadow", st == 200 and (r.get("result") or {}).get("count", 0) > 0, str(r.get("error", "")))
 
-            st, r = cmd("click_native", {"tab_id": tab, "selector": "#shadow-btn"})
+            st, r = cmd("click_native", {"tab_id": tab, "selector": "#shadow-btn", "focus": True})
             check("click_native shadow", st == 200, str(r.get("error", "")))
             st, r = cmd("eval", {"tab_id": tab, "code": "() => window.__shadowClicked === true"})
             check("marqueur shadow", st == 200 and r.get("result", {}).get("value") is True, str(r))
 
-            st, r = cmd("click_native", {"tab_id": tab, "selector": "#frame-btn"})
+            st, r = cmd("click_native", {"tab_id": tab, "selector": "#frame-btn", "focus": True})
             check("click_native iframe same-origin", st == 200, str(r.get("error", "")))
             st, r = cmd("eval", {"tab_id": tab, "code": "() => window.__frameClicked === true"})
             check("marqueur iframe", st == 200 and r.get("result", {}).get("value") is True, str(r))
