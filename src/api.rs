@@ -179,6 +179,7 @@ where
 ///
 /// `pub(crate)` : exposé à [`crate::solver`] pour partager la couche
 /// de transport vers l'extension entre les handlers API et le solveur.
+#[allow(clippy::result_large_err)] // Err = Response HTTP prête à renvoyer ; chemin froid.
 pub(crate) async fn send_cmd(
     channel: &ExtensionChannel,
     cmd: impl Into<String>,
@@ -1008,6 +1009,7 @@ fn extract_host(url: &str) -> Option<String> {
 /// Un échec de résolution (DNS indisponible) n'est pas bloquant : la
 /// navigation échouera d'elle-même, et bloquer casserait les domaines
 /// légitimes dont le DNS est lent. La limite est documentée.
+#[allow(clippy::result_large_err)] // Err = Response HTTP 400/403 ; chemin froid.
 async fn validate_target_url(url: &str) -> Result<(), Response> {
     let host = extract_host(url)
         .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "invalid_url"))?;
