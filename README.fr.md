@@ -143,8 +143,20 @@ Binaire produit : binaire unique `statically linked`, ~2,7 Mo, aucune dépendanc
 ```bash
 mkdir -p ~/.dsh-eyes/bin
 cp target/x86_64-unknown-linux-musl/release/dsh-eyes ~/.dsh-eyes/bin/
-cp -r extension ~/.dsh-eyes/extension
 ```
+
+Déploiement de l'extension vers le dossier chargé par Chrome :
+
+```bash
+scripts/deploy-extension.sh /mnt/c/Users/eddie/Downloads/dsh-eyes-extension-1.0.0
+```
+
+Puis `chrome://extensions` → DSH Eyes → **Recharger**, et saisir le token
+dans **Options** (voir « Auth WebSocket »).
+
+Le serveur MCP est configuré pour VS Code dans `.vscode/mcp.json` (stdio,
+`node mcp-server/server.js`). La CI GitHub Actions (`.github/workflows/ci.yml`)
+exécute tests Rust, clippy, build musl et vérifications Node.
 
 Lancement : `~/.dsh-eyes/bin/dsh-eyes` (écoute sur `127.0.0.1:8445`).
 

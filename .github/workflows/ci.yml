@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (tests, clippy, musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+  node:
+    name: Node (extension + MCP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntaxe de l'extension
+        run: |
+          node --check extension/options.js
+          node --input-type=module --check < extension/background.js
+      - name: Syntaxe du serveur MCP
+        run: node --check mcp-server/server.js
+      - name: Dépendances MCP
+        working-directory: mcp-server
+        run: npm ci --ignore-scripts

@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "dsh-eyes": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/home/eddie/projets/dsh-eyes/mcp-server/server.js"],
+      "env": {
+        "DSH_URL": "http://127.0.0.1:8445"
+      }
+    }
+  }
+}
