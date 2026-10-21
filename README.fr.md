@@ -186,7 +186,7 @@ dans **Options** (voir « Auth WebSocket »).
 
 Le serveur MCP est configuré pour VS Code dans `.vscode/mcp.json` (stdio,
 `node mcp-server/server.js`). La CI GitHub Actions (`.github/workflows/ci.yml`)
-exécute tests Rust, clippy, build musl et vérifications Node ; verte au run 39673427865.
+exécute tests Rust, clippy, build musl et vérifications Node ; verte aux runs 39673427865 et 39675973329.
 La surveillance CLOSE-WAIT tourne toutes les 5 min via
 `deploy/systemd/dsh-eyes-closewait.{service,timer}` et journalise dans
 `~/.dsh-eyes/close-wait.log` (échec si CLOSE-WAIT > 0).
