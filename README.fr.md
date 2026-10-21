@@ -270,7 +270,7 @@ Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
 
 ```bash
 scripts/e2e.py               # contrôles standards
-scripts/e2e.py --multiframe  # + shadow DOM / iframe same-origin
+scripts/e2e.py --multiframe  # + shadow DOM / iframe same-origin (validé live)
 ```
 
 Le script vérifie `/health`, `/v2/info`, le handshake, le SSRF, `tabs_create`,
