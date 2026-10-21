@@ -11,8 +11,8 @@ Démon d'observation des navigations Chrome + **mains** du navigateur
 - Routes v1 (ouvertes) : `GET /health`, `GET /stats`, `GET /events`, `GET /alerts`, `WS /ws`
 - Routes v2 (auth Bearer) : `GET /v2/info`, `GET /v2/metrics`, `GET /v2/ping`, `POST /v2/cmd`, `POST /v2/act`, `POST /v2/act/cancel`
 - Source : `src/` (Rust, axum 0.7 + tokio + tokio-tungstenite)
-- Tests : `tests/` — **138 tests exécutés** (21/10/2026), `cargo test` ; 2 ignorés (live Ollama + doc-test `ignore`)
-- **v1.1.0** : auth WS par token + handshake `hello`, garde-fou SSRF centralisé sur `/v2/cmd`, humanisation CDP, rotation des logs, `GET /v2/info`, métriques `GET /v2/metrics`, act batch idempotent (`POST /v2/act`, annulation coopérative)
+- Tests : `tests/` — **141 tests exécutés** (21/10/2026), `cargo test` ; 2 ignorés (live Ollama + doc-test `ignore`)
+- **v1.1.0** : auth WS par token + handshake `hello`, garde-fou SSRF centralisé sur `/v2/cmd`, humanisation CDP, rotation des logs, `GET /v2/info`, métriques `GET /v2/metrics`, act batch idempotent (`POST /v2/act`, annulation coopérative), rate limit 120/min (`429 rate_limited`)
 - Extension Chrome : `extension/` (MV3, à charger via `chrome://extensions` mode développeur)
 - Cockpit : `docs/cockpit.html`
 
@@ -259,7 +259,7 @@ Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
 
 ## Limites connues (v1.1.0)
 
-- **Tests `record`** : les 138 tests couvrent l'existant ; aucune suite dédiée aux routes `/v2/record/*` ni au CLI Python.
+- **Tests `record`** : les 141 tests couvrent l'existant ; aucune suite dédiée aux routes `/v2/record/*` ni au CLI Python.
 - **Audio** : `rec_ecran_cli.py` capture la vidéo seule ; le micro et l'audio système de l'application d'origine ne sont pas intégrés.
 - **Sécurité du démon** : `/v2/cmd` réapplique `is_forbidden_host` depuis la v1.1.0 ; `/ws` exige le token ; pas encore de rate limit ; `eval` reste une exécution JS arbitraire ; le handshake `hello` est informatif (pas de refus automatique en cas de version incompatible).
 - **Doc-test ignoré** : `src/vigil.rs:283` est un exemple ` ```ignore `, non exécuté — il ne compte pas comme test.
