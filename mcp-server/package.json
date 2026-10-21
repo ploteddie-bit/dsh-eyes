@@ -1,0 +1,14 @@
+{
+  "name": "dsh-eyes-mcp",
+  "version": "1.0.0",
+  "description": "Serveur MCP exposant le harnais dsh-eyes (pilotage du Chrome personnel d'Eddie : navigation, clics, saisie, lecture, capture) comme outils natifs VS Code.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  }
+}
