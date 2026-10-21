@@ -12,6 +12,7 @@ Démon d'observation des navigations Chrome + **mains** du navigateur
 - Routes v2 (auth Bearer) : `GET /v2/ping`, `POST /v2/cmd`
 - Source : `src/` (Rust, axum 0.7 + tokio + tokio-tungstenite)
 - Tests : `tests/` — **124 tests exécutés** (21/10/2026), `cargo test` ; 2 ignorés (live Ollama + doc-test `ignore`)
+- **v1.1.0** : auth WS par token + handshake `hello`, garde-fou SSRF centralisé sur `/v2/cmd`, humanisation CDP, rotation des logs, `GET /v2/info`
 - Extension Chrome : `extension/` (MV3, à charger via `chrome://extensions` mode développeur)
 - Cockpit : `docs/cockpit.html`
 
@@ -49,6 +50,26 @@ Codes de retour :
 - **504** + `{ok:false, error:"no_extension_connected"|"extension_timeout_30s"|"extension_disconnected"}`
   — pas d'extension connectée, ou l'extension n'a pas répondu dans
   les 30 s.
+
+### Auth WebSocket (v1.1.0)
+
+`/ws` exige le token d'API en query string (l'API WebSocket des navigateurs
+ne permet pas de header `Authorization` personnalisé) :
+
+```bash
+TOKEN=$(cat ~/.dsh-eyes/token)
+wscat -c "ws://127.0.0.1:8445/ws?token=$TOKEN"
+```
+
+L'extension lit le token dans `chrome.storage.local` (clé `dsh_token`).
+Après installation : `chrome://extensions` → carte DSH Eyes → **Options** →
+coller le contenu de `~/.dsh-eyes/token`. Le service worker envoie ensuite un
+handshake `hello` (client, version, capacités) exposé par `GET /v2/info` :
+
+```bash
+curl -s -H "Authorization: Bearer $(cat ~/.dsh-eyes/token)" \
+  http://127.0.0.1:8445/v2/info
+```
 
 Commandes supportées (cf. `extension/background.js`) :
 
@@ -196,11 +217,11 @@ kill $DAEMON_PID
 
 Voir `~/.dsh/docs/ecosysteme-local.md` (section « DSH Eyes »).
 
-## Limites connues (v1.0.0)
+## Limites connues (v1.1.0)
 
 - **Tests `record`** : les 124 tests couvrent l'existant ; aucune suite dédiée aux routes `/v2/record/*` ni au CLI Python.
 - **Audio** : `rec_ecran_cli.py` capture la vidéo seule ; le micro et l'audio système de l'application d'origine ne sont pas intégrés.
-- **Sécurité du démon** : `/v2/cmd` ne réapplique pas `is_forbidden_host` (contournement SSRF locale possible) ; `/ws` n'exige pas le token ; pas de rate limit ; pas de handshake de version entre extension et démon.
+- **Sécurité du démon** : `/v2/cmd` réapplique `is_forbidden_host` depuis la v1.1.0 ; `/ws` exige le token ; pas encore de rate limit ; `eval` reste une exécution JS arbitraire ; le handshake `hello` est informatif (pas de refus automatique en cas de version incompatible).
 - **Doc-test ignoré** : `src/vigil.rs:283` est un exemple ` ```ignore `, non exécuté — il ne compte pas comme test.
 
 ## Licence
