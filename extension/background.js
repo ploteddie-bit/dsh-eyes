@@ -1433,6 +1433,17 @@ async function cmdScreenshot({ tab_id, format }) {
   if (!tab || typeof tab.windowId !== "number") {
     throw new Error("screenshot: onglet introuvable ou sans windowId");
   }
+  // Fix 21/10 (timeout 25 s constaté) : captureVisibleTab exige un rendu
+  // VISIBLE — si la fenêtre est minimisée/occultée, la capture attend
+  // indéfiniment et dépasse le timeout local (leçon l.1153 généralisée).
+  // On restaure la fenêtre AVANT toute capture.
+  try {
+    const win = await chrome.windows.get(tab.windowId);
+    if (win.state === "minimized" || win.state === "docked") {
+      await chrome.windows.update(tab.windowId, { state: "maximized", focused: true });
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  } catch (_) { /* fenêtre fermée */ }
   // v0.6.0 : captureVisibleTab capture l'onglet ACTIF de la fenêtre —
   // MYSTÈRE RÉSOLU (20/10) : sans activation, on photographiait TOUJOURS
   // l'onglet actif (d'où les captures « figées », md5 identiques malgré
