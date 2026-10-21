@@ -1,0 +1,11 @@
+[Unit]
+Description=DSH Eyes — contrôle CLOSE-WAIT toutes les 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=dsh-eyes-closewait.service
+
+[Install]
+WantedBy=timers.target

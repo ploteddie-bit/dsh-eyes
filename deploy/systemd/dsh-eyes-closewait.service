@@ -1,0 +1,7 @@
+[Unit]
+Description=DSH Eyes — contrôle des sockets CLOSE-WAIT sur 8445
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/eddie/projets/dsh-eyes/scripts/check-close-wait.sh
