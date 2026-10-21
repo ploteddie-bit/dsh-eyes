@@ -1454,9 +1454,25 @@ async function cmdScreenshot({ tab_id, format }) {
     await new Promise((r) => setTimeout(r, 200));
   }
   const fmt = format === "jpeg" ? "jpeg" : "png";
-  const data_url = await chrome.tabs.captureVisibleTab(tab.windowId, {
-    format: fmt,
-  });
+  // Fix 21/10 v1.0.2 : captureVisibleTab exige <all_urls> EFFECTIF (réglage
+  // « accès aux sites » que Chrome réinitialise à chaque rechargement ↻) ou
+  // activeTab (interaction). Fallback CDP : Page.captureScreenshot via le
+  // debugger — permission "debugger" du manifest, TOUJOURS effective (le
+  // read l'utilise déjà). Résultat identique (base64), zéro dépendance au
+  // réglage d'accès.
+  let data_url;
+  try {
+    data_url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: fmt });
+  } catch (err_visible) {
+    const cdp = await withDebugger(real_tab_id, async (dbg) => {
+      const r = await dbg("Page.captureScreenshot", { format: fmt });
+      return r && r.data ? "data:image/" + fmt + ";base64," + r.data : null;
+    });
+    if (!cdp) {
+      throw new Error("screenshot: échec captureVisibleTab (" + String(err_visible) + ") ET fallback CDP vide");
+    }
+    data_url = cdp;
+  }
   if (typeof data_url !== "string" || !data_url.startsWith("data:image/")) {
     throw new Error("screenshot: captureVisibleTab n'a pas renvoyé de dataURL");
   }
