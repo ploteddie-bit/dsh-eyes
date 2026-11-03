@@ -1,4 +1,5 @@
 mod api;
+mod atspi;
 mod auth;
 mod config;
 mod hands;
@@ -34,8 +35,25 @@ async fn main() -> anyhow::Result<()> {
     let channel = hands::channel::ExtensionChannel::new();
 
     let app = api::router_with_v2(ctx, config, channel);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8445").await?;
-    tracing::info!("dsh-eyes écoute sur 127.0.0.1:8445");
+    let port = std::env::var("DSH_EYES_PORT")
+        .ok()
+        .map(|valeur| {
+            valeur
+                .parse::<u16>()
+                .map_err(|e| anyhow::anyhow!("DSH_EYES_PORT invalide : {e}"))
+                .and_then(|port| {
+                    if port < 1024 {
+                        Err(anyhow::anyhow!("DSH_EYES_PORT doit être entre 1024 et 65535"))
+                    } else {
+                        Ok(port)
+                    }
+                })
+        })
+        .transpose()?
+        .unwrap_or(8445);
+    let adresse = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&adresse).await?;
+    tracing::info!(%adresse, "dsh-eyes écoute sur le loopback");
     axum::serve(listener, app).await?;
     Ok(())
 }

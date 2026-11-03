@@ -1080,6 +1080,8 @@ fn v2_router(
             "/page/solve",
             post(crate::solver::solve_handler),
         )
+        .route("/vision/locate", post(crate::solver::locate_handler))
+        .route("/atspi/read", post(crate::atspi::lire_handler))
         .route_layer(middleware::from_fn(require_token))
         .layer(Extension(AuthToken(token)))
         .layer(Extension(solver_config))

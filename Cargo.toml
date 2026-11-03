@@ -1,6 +1,6 @@
 [package]
 name = "dsh-eyes"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [dependencies]
@@ -32,3 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "htt
 [features]
 # Réservé pour de futurs stubs de test (désactivé par défaut).
 test-util = []
+lecture-atspi = []
+
+[[bin]]
+name = "atspi-lire"
+path = "src/bin/atspi-lire.rs"
+required-features = ["lecture-atspi"]

@@ -48,7 +48,7 @@ async function appelJson(methode, chemin, corps) {
 
 const AVERTISSEMENT = "Exécuté dans le Chrome PERSONNEL d'Eddie. Ne JAMAIS taper un identifiant/mot de passe/captcha à sa place — demander à Eddie. Stop immédiat si détection anti-bot.";
 
-const serveur = new McpServer({ name: "dsh-eyes", version: "1.1.0" });
+const serveur = new McpServer({ name: "dsh-eyes", version: "1.2.0" });
 
 serveur.registerTool(
   "dsh_ping",
@@ -218,6 +218,21 @@ serveur.registerTool(
   },
   async ({ action_id }) => ({
     content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/act/cancel", { action_id })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_atspi_read",
+  {
+    description: "Lit les contrôles Linux/WSLg via la route AT-SPI du démon : noms, rôles, états et rectangles, sans inférence.",
+    inputSchema: {
+      application: z.string().describe("Filtre obligatoire sur le nom de l'application Linux"),
+      texte: z.string().optional().describe("Filtre optionnel sur le libellé du contrôle"),
+      limite: z.number().optional().describe("Nombre maximal global d'éléments (1 à 500)"),
+    },
+  },
+  async ({ application, texte, limite }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/atspi/read", { application, texte, limite })) }],
   })
 );
 

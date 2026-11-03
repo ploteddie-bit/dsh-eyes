@@ -332,12 +332,193 @@ impl OllamaClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LocalisationVision {
+    pub x: f64,
+    pub y: f64,
+    pub largeur: f64,
+    pub hauteur: f64,
+}
+
+fn analyser_localisation(
+    texte: &str,
+    largeur_image: f64,
+    hauteur_image: f64,
+) -> Result<LocalisationVision, String> {
+    let debut = texte.find('{').ok_or_else(|| "JSON de localisation absent".to_string())?;
+    let fin = texte.rfind('}').ok_or_else(|| "JSON de localisation absent".to_string())?;
+    if fin <= debut {
+        return Err("JSON de localisation invalide".into());
+    }
+    let valeur: Value = serde_json::from_str(&texte[debut..=fin])
+        .map_err(|e| format!("JSON de localisation invalide : {e}"))?;
+    let nombre = |champ: &str| {
+        valeur
+            .get(champ)
+            .and_then(Value::as_f64)
+            .filter(|nombre| nombre.is_finite())
+            .ok_or_else(|| format!("champ de localisation invalide : {champ}"))
+    };
+    let localisation = LocalisationVision {
+        x: nombre("x")?,
+        y: nombre("y")?,
+        largeur: nombre("largeur")?,
+        hauteur: nombre("hauteur")?,
+    };
+    if localisation.x < 0.0
+        || localisation.y < 0.0
+        || localisation.largeur <= 0.0
+        || localisation.hauteur <= 0.0
+        || localisation.x + localisation.largeur > largeur_image
+        || localisation.y + localisation.hauteur > hauteur_image
+    {
+        return Err("rectangle de localisation hors limites de l’image".into());
+    }
+    Ok(localisation)
+}
+
+impl OllamaClient {
+    pub async fn localiser(
+        &self,
+        image_b64: &str,
+        cible: &str,
+        largeur_image: u32,
+        hauteur_image: u32,
+    ) -> Result<(LocalisationVision, u8), OllamaError> {
+        if cible.trim().is_empty() || largeur_image == 0 || hauteur_image == 0 {
+            return Err(OllamaError {
+                tier1_err: "cible et dimensions de l’image sont obligatoires".into(),
+                tier2_err: String::new(),
+            });
+        }
+        let prompt = format!(
+            "Analyse cette interface de {} x {} pixels. Repère l’élément cliquable « {} ». \
+             Réponds UNIQUEMENT avec {{\"x\":0,\"y\":0,\"largeur\":0,\"hauteur\":0}} en pixels. \
+             x est le bord GAUCHE et y le bord SUPÉRIEUR. \
+             largeur = bord droit - bord gauche, hauteur = bord bas - bord haut. \
+             Ne donne pas le centre et ne produis jamais de valeurs fictives ou hors limites.",
+            largeur_image,
+            hauteur_image,
+            cible.trim()
+        );
+        let tier1_err = match self
+            .try_tier(&self.tier1_url, &self.tier1_token, image_b64, &prompt)
+            .await
+        {
+            Ok(reponse) => match analyser_localisation(
+                &reponse,
+                f64::from(largeur_image),
+                f64::from(hauteur_image),
+            ) {
+                Ok(localisation) => return Ok((localisation, 1)),
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        let tier2_err = match self
+            .try_tier(&self.tier2_url, &self.tier2_token, image_b64, &prompt)
+            .await
+        {
+            Ok(reponse) => match analyser_localisation(
+                &reponse,
+                f64::from(largeur_image),
+                f64::from(hauteur_image),
+            ) {
+                Ok(localisation) => return Ok((localisation, 2)),
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
+        Err(OllamaError { tier1_err, tier2_err })
+    }
+}
+
+#[cfg(test)]
+mod tests_vision {
+    use super::*;
+
+    #[test]
+    fn localisation_json_est_lue_en_pixels() {
+        let mesure = analyser_localisation(
+            "```json\n{\"x\":100,\"y\":50,\"largeur\":200,\"hauteur\":40}\n```",
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        assert_eq!(mesure.x, 100.0);
+        assert_eq!(mesure.y, 50.0);
+        assert_eq!(mesure.largeur, 200.0);
+        assert_eq!(mesure.hauteur, 40.0);
+    }
+
+    #[test]
+    fn localisation_hors_image_est_refusee() {
+        assert!(analyser_localisation(
+            "{\"x\":790,\"y\":50,\"largeur\":20,\"hauteur\":40}",
+            800.0,
+            600.0,
+        )
+        .is_err());
+        assert!(analyser_localisation("absent", 800.0, 600.0).is_err());
+        assert!(analyser_localisation("reponse } puis {", 800.0, 600.0).is_err());
+    }
+}
+
 /// Strippe le préfixe MIME `data:image/...;base64,` d'une chaîne base64
 /// si présent. Ollama attend du base64 brut.
 fn strip_data_url_prefix(s: &str) -> &str {
     s.split_once(',')
         .map(|(_, payload)| payload)
         .unwrap_or(s)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocateRequest {
+    pub image_b64: String,
+    pub cible: String,
+    pub largeur: u32,
+    pub hauteur: u32,
+}
+
+pub async fn locate_handler(
+    Extension(solver_config): Extension<SolverConfig>,
+    body: Result<Json<LocateRequest>, JsonRejection>,
+) -> Response {
+    let req = match body {
+        Ok(Json(r)) => r,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_body"),
+    };
+    crate::api::log_action(
+        "vision_locate",
+        serde_json::json!({
+            "cible": req.cible,
+            "largeur": req.largeur,
+            "hauteur": req.hauteur
+        }),
+    );
+    let client = OllamaClient::new(&solver_config);
+    match client
+        .localiser(&req.image_b64, &req.cible, req.largeur, req.hauteur)
+        .await
+    {
+        Ok((localisation, tier)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "result": localisation,
+                "tier": tier
+            })),
+        )
+            .into_response(),
+        Err(erreur) => {
+            tracing::warn!(
+                tier1_err = %erreur.tier1_err,
+                tier2_err = %erreur.tier2_err,
+                "localisation visuelle indisponible"
+            );
+            error_response(StatusCode::BAD_GATEWAY, "vision_unavailable")
+        }
+    }
 }
 
 /// Tente d'appliquer la solution text via `fill` + `click` sur un bouton

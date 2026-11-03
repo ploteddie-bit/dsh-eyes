@@ -97,6 +97,26 @@ The CLI lives in `bin/rec_ecran_cli.py` (source) and `%USERPROFILE%\Documents\Mo
 
 Output: `OK WIDTHxHEIGHT cursor mode@(x,y)` then the WSL path. The crop reduces the loss of detail caused by the model's image downscaling.
 
+### Native window visual location
+
+`POST /v2/vision/locate` is a Bearer-protected loopback route. Its JSON body contains `image_b64`, `cible`, `largeur` and `hauteur`; it returns a pixel rectangle validated against the supplied image dimensions. Axum's default 2 MiB request-body limit applies, so large captures must be resized before encoding.
+
+`DSH_EYES_PORT` optionally overrides the default port `8445` (allowed range: 1024-65535); the listener always remains on `127.0.0.1`. `scripts/vision-clic.py` creates its temporary capture with mode `0600` and removes it on exit. `bin/os-clic.sh` refuses to click when the target window is absent, newly restored, or not confirmed in the foreground.
+
+### Linux controls through AT-SPI
+
+The optional Rust binary `atspi-lire` reads Linux accessibility trees directly through the system `libatspi`, without Python or an additional crate. It is separate from the static `musl` daemon and builds only with the `lecture-atspi` feature:
+
+```bash
+cargo build --release --bin atspi-lire --features lecture-atspi
+install -m 0755 target/release/atspi-lire ~/.dsh-eyes/bin/atspi-lire
+~/.dsh-eyes/bin/atspi-lire --application agent --texte "Rechercher" --limite 20
+```
+
+`POST /v2/atspi/read` is the daemon's Bearer-protected route. It requires `application`, accepts optional `texte` and `limite` (1-500), invokes the sibling GNU binary with a five-second timeout, and returns the same JSON tree. The MCP server exposes it as `dsh_atspi_read`. Build this helper for the host GNU target, never for `musl`; the daemon itself remains static.
+
+Each matching control includes its name, role, enabled/visibility states and rectangles. For WSLg, add `rectangle_ecran_linux` to the Windows window origin measured through UI Automation, then use the verified `os-clic.sh` focus path. This coordinate mapping was confirmed by a real catalogue search and a 90.00 EUR offer validation without inference. Ollama remains a fallback for applications that do not expose their controls through AT-SPI.
+
 ### Native gesture usage doctrine (v0.4)
 
 Derived from new-pmu (rules 9-10 of 2026-10-12, measured in live A/B):

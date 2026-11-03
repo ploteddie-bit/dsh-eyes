@@ -14,6 +14,7 @@
 //!   `/v2/page/{id}/solve`.
 
 pub mod api;
+pub mod atspi;
 pub mod auth;
 pub mod config;
 pub mod hands;
