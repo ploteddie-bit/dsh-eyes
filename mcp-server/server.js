@@ -48,7 +48,7 @@ async function appelJson(methode, chemin, corps) {
 
 const AVERTISSEMENT = "Exécuté dans le Chrome PERSONNEL d'Eddie. Ne JAMAIS taper un identifiant/mot de passe/captcha à sa place — demander à Eddie. Stop immédiat si détection anti-bot.";
 
-const serveur = new McpServer({ name: "dsh-eyes", version: "1.2.0" });
+const serveur = new McpServer({ name: "dsh-eyes", version: "1.3.0" });
 
 serveur.registerTool(
   "dsh_ping",
@@ -243,6 +243,157 @@ serveur.registerTool(
   },
   async () => ({
     content: [{ type: "text", text: JSON.stringify(await appelJson("GET", "/v2/metrics")) }],
+  })
+);
+
+// ── Parité WebBridge (2026-11-06) ────────────────────────────────────────
+// Ces outils exposent les routes ajoutées pour combler les écarts de
+// l'audit : snapshot d'accessibilité, cycle de vie des onglets, clavier,
+// capture, réseau, PDF, upload, CDP et application d'un captcha.
+
+serveur.registerTool(
+  "dsh_snapshot",
+  {
+    description: "Arbre d'accessibilité de l'onglet : nœuds {ref, role, name, level} + frames. Les refs @eN servent ensuite de sélecteur à dsh_click/dsh_fill/dsh_wait.",
+    inputSchema: {
+      tab_id: z.number().optional().describe("Onglet (actif par défaut)"),
+      max_chars: z.number().optional().describe("Borne du JSON renvoyé"),
+      ref: z.string().optional().describe("Réf @eN : renvoie son sous-arbre"),
+    },
+  },
+  async ({ tab_id, max_chars, ref }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/snapshot", { tab_id, max_chars, ref })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_tabs",
+  {
+    description: "Cycle de vie des onglets : list (lister), attach (adopter), close (fermer), close_session (fermer la session sans toucher aux onglets empruntés).",
+    inputSchema: {
+      op: z.enum(["list", "attach", "close", "close_session"]),
+      tab_id: z.number().optional(),
+      session: z.string().optional().describe("Nom de session pour close_session"),
+      all_windows: z.boolean().optional().describe("list sur toutes les fenêtres"),
+    },
+  },
+  async ({ op, tab_id, session, all_windows }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/tabs", { op, tab_id, session, all_windows })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_send_keys",
+  {
+    description: "Clavier natif (combinaisons Enter, Escape, Mod+A…). focus_emulation pour un onglet en arrière-plan.",
+    inputSchema: {
+      keys: z.string().describe("Combinaison, ex. Enter, Escape, Mod+A, Shift+Tab"),
+      tab_id: z.number().optional(),
+      focus_emulation: z.boolean().optional(),
+    },
+  },
+  async ({ keys, tab_id, focus_emulation }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/send_keys", { keys, tab_id, focus_emulation })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_screenshot",
+  {
+    description: "Capture d'écran (viewport, élément via selector, ou full_page) ; avec path, le démon écrit le fichier.",
+    inputSchema: {
+      tab_id: z.number().optional(),
+      selector: z.string().optional(),
+      full_page: z.boolean().optional(),
+      path: z.string().optional().describe("Chemin d'écriture côté démon"),
+      format: z.enum(["png", "jpeg"]).optional(),
+    },
+  },
+  async ({ tab_id, selector, full_page, path, format }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/page/screenshot", { tab_id, selector, full_page, path, format })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_network",
+  {
+    description: "Capture réseau par onglet : start, list (filtre URL), detail (corps borné), stop.",
+    inputSchema: {
+      op: z.enum(["start", "stop", "list", "detail"]),
+      tab_id: z.number().optional(),
+      filter: z.string().optional(),
+      request_id: z.string().optional(),
+    },
+  },
+  async ({ op, tab_id, filter, request_id }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/network", { op, tab_id, filter, request_id })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_pdf",
+  {
+    description: "Export PDF de la page ; avec path, le démon écrit le fichier.",
+    inputSchema: {
+      tab_id: z.number().optional(),
+      path: z.string().optional(),
+      paper_format: z.string().optional().describe("a4, letter…"),
+      print_background: z.boolean().optional(),
+    },
+  },
+  async ({ tab_id, path, paper_format, print_background }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/pdf", { tab_id, path, paper_format, print_background })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_upload",
+  {
+    description: "Dépose des fichiers dans un input file (chemins accessibles à Windows).",
+    inputSchema: {
+      selector: z.string().describe("Sélecteur de l'input file"),
+      files: z.array(z.string()).describe("Chemins absolus"),
+      tab_id: z.number().optional(),
+    },
+  },
+  async ({ selector, files, tab_id }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/upload", { selector, files, tab_id })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_cdp",
+  {
+    description: "Passe-plat CDP sous liste blanche (Page.* sauf navigate, Network.*, DOM.*, Runtime.evaluate, Emulation.*, Accessibility.*).",
+    inputSchema: {
+      method: z.string(),
+      params: z.record(z.any()).optional(),
+      tab_id: z.number().optional(),
+    },
+  },
+  async ({ method, params, tab_id }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/cdp", { method, params, tab_id })) }],
+  })
+);
+
+serveur.registerTool(
+  "dsh_captcha_apply",
+  {
+    description: "Applique une solution de captcha fournie par l'appelant : grid (cases à cliquer), slider (delta_x), text (input + texte). " + AVERTISSEMENT,
+    inputSchema: {
+      kind: z.enum(["grid", "slider", "text"]),
+      selector: z.string().optional().describe("Conteneur (grid) ou poignée (slider)"),
+      cells: z.array(z.number()).optional().describe("Indices row-major (grid)"),
+      rows: z.number().optional(),
+      cols: z.number().optional(),
+      delta_x: z.number().optional().describe("Distance du glissement (slider)"),
+      input_selector: z.string().optional().describe("Champ (text)"),
+      text: z.string().optional().describe("Solution texte"),
+      tab_id: z.number().optional(),
+    },
+  },
+  async ({ kind, selector, cells, rows, cols, delta_x, input_selector, text, tab_id }) => ({
+    content: [{ type: "text", text: JSON.stringify(await appelJson("POST", "/v2/page/captcha/apply", { kind, selector, cells, rows, cols, delta_x, input_selector, text, tab_id })) }],
   })
 );
 

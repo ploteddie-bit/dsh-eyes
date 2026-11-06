@@ -36,7 +36,7 @@
 //!   Le `cmd_id` est utilisé pour router la réponse vers le `oneshot`
 //!   de la requête correspondante.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -143,6 +143,9 @@ struct CommandStats {
     error: AtomicU64,
     timeout: AtomicU64,
     total_ms: AtomicU64,
+    /// Les 200 dernières durées (ms) : sert aux percentiles p50/p95 exposés
+    /// par `/v2/metrics` (instrumentation P3, 2026-11-06).
+    recent: StdMutex<VecDeque<u64>>,
 }
 
 /// Issue d'une commande pour les métriques.
@@ -180,6 +183,15 @@ impl Metrics {
         self.total_ms.fetch_add(ms, Ordering::Relaxed);
         let stats = self.stats_for(cmd);
         stats.total_ms.fetch_add(ms, Ordering::Relaxed);
+        {
+            // Fenêtre glissante bornée : percentiles représentatifs sans
+            // croissance mémoire (200 dernières commandes par nom).
+            let mut recent = stats.recent.lock().unwrap_or_else(|e| e.into_inner());
+            if recent.len() >= 200 {
+                recent.pop_front();
+            }
+            recent.push_back(ms);
+        }
         match outcome {
             Outcome::Ok => {
                 self.ok.fetch_add(1, Ordering::Relaxed);
@@ -210,6 +222,22 @@ impl Metrics {
         let mut per_command = serde_json::Map::new();
         let map = self.per_command.lock().unwrap_or_else(|e| e.into_inner());
         for (cmd, s) in map.iter() {
+            // Percentiles calculés sur la fenêtre glissante des 200
+            // dernières durées (p50 = médiane, p95 = queue lente).
+            let (p50, p95) = {
+                let recent = s.recent.lock().unwrap_or_else(|e| e.into_inner());
+                if recent.is_empty() {
+                    (0_u64, 0_u64)
+                } else {
+                    let mut sorted: Vec<u64> = recent.iter().copied().collect();
+                    sorted.sort_unstable();
+                    let at = |q: f64| {
+                        let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+                        sorted[idx.min(sorted.len() - 1)]
+                    };
+                    (at(0.50), at(0.95))
+                }
+            };
             per_command.insert(
                 cmd.clone(),
                 serde_json::json!({
@@ -218,6 +246,8 @@ impl Metrics {
                     "error": s.error.load(Ordering::Relaxed),
                     "timeout": s.timeout.load(Ordering::Relaxed),
                     "total_ms": s.total_ms.load(Ordering::Relaxed),
+                    "p50_ms": p50,
+                    "p95_ms": p95,
                 }),
             );
         }

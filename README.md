@@ -96,12 +96,18 @@ Commandes ajoutées pour couvrir les écarts de l'audit du 2026-11-06
 - `cdp {tab_id?, method, params?}` — passe-plat avec liste blanche (`Page.*`
   sauf `navigate`, `Network.*`, `DOM.*`, `Runtime.evaluate`, `Emulation.*`,
   `Accessibility.*`).
+- `captcha_apply {tab_id?, kind:"grid"|"slider"|"text", selector?, cells?,
+  rows?, cols?, delta_x?, input_selector?, text?}` — applique une solution
+  fournie par l'appelant : clic natif des cases d'une grille, glissement natif
+  d'un slider, ou saisie native d'un captcha texte (P3, 2026-11-06).
 
 Routes démon correspondantes : `/v2/snapshot`, `/v2/tabs`, `/v2/send_keys`,
-`/v2/network`, `/v2/pdf`, `/v2/upload`, `/v2/cdp`, plus les champs ajoutés à
-`/v2/read` (`frame`, `start`) et `/v2/page/screenshot` (`selector`,
-`full_page`, `path`). Le démon refuse (`command_not_supported`) une commande
-de parité que l'extension n'annonce pas dans son `hello`.
+`/v2/network`, `/v2/pdf`, `/v2/upload`, `/v2/cdp`,
+`/v2/page/captcha/apply`, plus les champs ajoutés à
+`/v2/read` (`frame`, `start`), `/v2/page/screenshot` (`selector`,
+`full_page`, `path`) et `/v2/goto` (`tab_id`). Le démon refuse
+(`command_not_supported`) une commande de parité que l'extension n'annonce pas
+dans son `hello`.
 
 Note v1.0.0 (changes introduced in 0.6.1, now frozen in the major version):
 - Commands are **serialized per tab** (`tab_id`): two concurrent calls on the same tab no longer collide on `chrome.debugger.attach`.
@@ -247,11 +253,20 @@ kill $DAEMON_PID
 
 See `~/.dsh/docs/ecosysteme-local.md` ("DSH Eyes" section).
 
-## Known limitations (v1.0.0)
+## Known limitations (v1.3.0)
 
 - **`record` tests**: the 124 tests cover what exists; there is no dedicated test suite for the `/v2/record/*` routes nor for the Python CLI.
 - **Audio**: `rec_ecran_cli.py` captures video only; the microphone and the original application's system audio are not integrated.
-- **Daemon security**: `/v2/cmd` does not re-apply `is_forbidden_host` (local SSRF bypass possible); `/ws` does not require the token; no rate limit; no version handshake between the extension and the daemon.
+- **Daemon security (état mesuré le 2026-11-06)** : les trois limitations historiques ne sont plus vraes —
+  `/v2/cmd` réapplique bien `is_forbidden_host` (`forbidden_target` mesuré sur
+  `127.0.0.1`), `/ws` **exige** le token (`?token=`, connexion refusée sans lui),
+  et le rate limit des commandes API existe (token bucket 120/min, rafale 60).
+  Le handshake démon↔extension existe aussi (`hello` + `/v2/info`), et le démon
+  refuse désormais une commande de parité non annoncée (`command_not_supported`).
+- **Captcha** : la détection et la proposition de solution existent ; l'application
+  est assurée par `captcha_apply` (grille, slider, texte) à partir de la solution
+  fournie par l'appelant — il n'y a pas de résolution automatique de grille
+  d'images par le démon.
 - **Ignored doc-test**: `src/vigil.rs:283` is an ` ```ignore ` example, not executed — it does not count as a test.
 
 ## License

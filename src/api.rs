@@ -65,6 +65,7 @@ const PARITY_COMMANDS: &[&str] = &[
     "pdf",
     "upload",
     "cdp",
+    "captcha_apply",
 ];
 
 #[derive(Serialize)]
@@ -1499,6 +1500,104 @@ async fn v2_cdp(
     forward(&channel, "cdp", params, "cdp").await
 }
 
+/// Corps de `POST /v2/page/captcha/apply` — applique une solution de
+/// captcha (grille, slider, texte). Contrat : `docs/protocol-parity-2026-11-06.md` §10.
+#[derive(Debug, Deserialize)]
+pub struct CaptchaApplyRequest {
+    pub tab_id: Option<i64>,
+    /// `grid` | `slider` | `text`
+    pub kind: Option<String>,
+    /// Conteneur du captcha (grille) ou poignée (slider).
+    #[serde(default)]
+    pub selector: Option<String>,
+    /// Indices row-major des cases à cliquer (grille).
+    #[serde(default)]
+    pub cells: Vec<u32>,
+    #[serde(default)]
+    pub rows: Option<u32>,
+    #[serde(default)]
+    pub cols: Option<u32>,
+    /// Distance horizontale du glissement, en pixels CSS (slider).
+    #[serde(default)]
+    pub delta_x: Option<f64>,
+    /// Champ à remplir (captcha texte).
+    #[serde(default)]
+    pub input_selector: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// Handler `POST /v2/page/captcha/apply` — applique la solution fournie par
+/// l'appelant (agent ou modèle vision) : clic natif des cases d'une grille,
+/// glissement natif d'un slider, ou saisie native d'un captcha texte.
+async fn v2_page_captcha_apply(
+    Extension(channel): Extension<ExtensionChannel>,
+    body: ValidatedJson<CaptchaApplyRequest>,
+) -> Response {
+    let ValidatedJson(Json(req)) = body;
+    let kind = match req.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(kind) => kind.to_ascii_lowercase(),
+        None => return error_response(StatusCode::BAD_REQUEST, "missing_kind"),
+    };
+    let mut params = json!({ "tab_id": req.tab_id, "kind": kind });
+    let selector = req
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match kind.as_str() {
+        "grid" => {
+            let selector = match selector {
+                Some(selector) => selector,
+                None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
+            };
+            if req.cells.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "missing_cells");
+            }
+            params["selector"] = json!(selector);
+            params["cells"] = json!(req.cells);
+            params["rows"] = json!(req.rows.unwrap_or(3));
+            params["cols"] = json!(req.cols.unwrap_or(3));
+        }
+        "slider" => {
+            let selector = match selector {
+                Some(selector) => selector,
+                None => return error_response(StatusCode::BAD_REQUEST, "missing_selector"),
+            };
+            let delta_x = match req.delta_x {
+                Some(delta) => delta,
+                None => return error_response(StatusCode::BAD_REQUEST, "missing_delta_x"),
+            };
+            params["selector"] = json!(selector);
+            params["delta_x"] = json!(delta_x);
+        }
+        "text" => {
+            let input_selector = match req
+                .input_selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(selector) => selector,
+                None => return error_response(StatusCode::BAD_REQUEST, "missing_input_selector"),
+            };
+            let text = match req.text.as_deref().filter(|s| !s.is_empty()) {
+                Some(text) => text,
+                None => return error_response(StatusCode::BAD_REQUEST, "missing_text"),
+            };
+            params["input_selector"] = json!(input_selector);
+            params["text"] = json!(text);
+        }
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("kind_inconnu: '{other}' (attendu grid, slider ou text)"),
+            );
+        }
+    }
+    forward(&channel, "captcha_apply", params, "captcha_apply").await
+}
+
 /// Construit le sous-router `/v2` avec l'auth middleware appliqué.
 ///
 /// **Lot B — D2 (2026-10-07)** : la `SolverConfig` (URLs Ollama +
@@ -1537,6 +1636,7 @@ fn v2_router(
         .route("/record/status", get(crate::record::status))
         .route("/page/screenshot", post(v2_page_screenshot))
         .route("/page/captcha", post(v2_page_captcha))
+        .route("/page/captcha/apply", post(v2_page_captcha_apply))
         .route("/page/group", post(v2_page_group))
         // Task 7 : solveur de captcha. Le brief spécifiait
         // `/v2/page/{id}/solve` mais le `{id}` n'est pas utilisé (le

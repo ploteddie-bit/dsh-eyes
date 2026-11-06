@@ -161,3 +161,38 @@ Retour : `{"text":"…","complete":true,"next_start":null,"frame":"#f1"}`
    plein écran, PDF, capture réseau, upload, cdp.
 3. Aucun `commande inconnue` : chaque commande envoyée est annoncée dans
    `hello.capabilities`.
+
+## 10. `captcha_apply` — appliquer une solution (P3 différenciation)
+
+Le solveur existant détecte et propose une réponse ; cette commande **applique**
+la solution fournie par l'appelant (agent ou modèle vision) sans dépendre d'un
+service tiers.
+
+```json
+{"cmd":"captcha_apply","params":{
+  "tab_id": 42,
+  "kind": "grid" | "slider" | "text",
+  "selector": "#captcha-zone",
+  "cells": [0,4,8],
+  "rows": 3, "cols": 3,
+  "delta_x": 137,
+  "input_selector": "#captcha-input",
+  "text": "AB12C"
+}}
+```
+
+- `grid` : `selector` désigne le conteneur (élément iframe ou div du captcha).
+  `cells` = indices row-major `0..rows*cols-1`. L'extension calcule le rectangle
+  du conteneur, le découpe en `rows`×`cols` et exécute un **clic natif**
+  (`Input.dispatchMouseEvent`, `isTrusted=true`) au centre de chaque case.
+  Réponse : `{applied:true, kind:"grid", cells, rect, clicked:n}`.
+- `slider` : `selector` désigne la poignée à glisser ; `delta_x` = distance
+  horizontale en pixels CSS. Glissement natif : `mousePressed`, mouvements
+  intermédiaires (15-30 pas, léger jitter), `mouseReleased`, avec vérification
+  du déplacement observé. Réponse : `{applied:true, kind:"slider", delta_x, verified}`.
+- `text` : `input_selector` + `text` → saisie native (`type_native`). Réponse :
+  `{applied:true, kind:"text", verified}`.
+- Erreurs : `missing_selector`, `sélecteur introuvable: …`, `invalid_cells`,
+  `missing_delta_x`, `kind_inconnu: …`.
+
+Route démon : `POST /v2/page/captcha/apply` (mêmes champs, préfixe `captcha_apply`).
