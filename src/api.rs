@@ -741,14 +741,21 @@ async fn v2_read(
 // Endpoints de commodité qui enveloppent `send_cmd` (modèle webbridge),
 // mêmes motifs que `v2_open`/`v2_read`.
 
-/// Corps de `POST /v2/goto {"url"}`.
+/// Corps de `POST /v2/goto {"url", "tab_id"?}`.
 #[derive(Debug, Deserialize)]
 pub struct GotoRequest {
     pub url: Option<String>,
+    /// Onglet à naviguer. Omis : comportement historique (onglet de travail
+    /// de la session / création). Fourni depuis le 2026-11-06 pour que la
+    /// navigation ciblée fonctionne (parité WebBridge, `navigate` sur un
+    /// onglet existant).
+    #[serde(default)]
+    pub tab_id: Option<i64>,
 }
 
-/// Handler `POST /v2/goto` — même sémantique que `/v2/open` (la commande
-/// extension `goto` fait `chrome.tabs.create`) ; garde-fou identique.
+/// Handler `POST /v2/goto` — navigue vers `url`, dans `tab_id` quand il est
+/// fourni, sinon dans l'onglet de travail de la session (comportement
+/// historique, identique à `/v2/open`). Garde-fou d'hôte identique.
 async fn v2_goto(
     Extension(channel): Extension<ExtensionChannel>,
     body: ValidatedJson<GotoRequest>,
@@ -761,7 +768,10 @@ async fn v2_goto(
     if let Err(resp) = validate_target_url(url).await {
         return resp;
     }
-    let params = json!({ "url": url, "active": true });
+    let mut params = json!({ "url": url, "active": true });
+    if let Some(tab_id) = req.tab_id {
+        params["tab_id"] = json!(tab_id);
+    }
     log_action("goto", params.clone());
     match send_cmd(&channel, "goto", params).await {
         Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result" : result }))).into_response(),
