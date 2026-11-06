@@ -28,6 +28,12 @@ import { humanMousePath, humanTypingPlan, humanScrollPlan, humanProfile } from "
 // trajectoire démarrent d'ici — jamais du même point deux fois de suite).
 const cursorState = new Map(); // tab_id → {x, y}
 
+// Onglets dont le debugger est attaché DURABLEMENT (capture `network`,
+// contrat §6). `withDebugger` réutilise cette session au lieu de se
+// l'attribuer (« Another debugger is already attached »), et ne la
+// détache pas en sortie — sinon la capture en cours serait coupée.
+const debuggerPersistant = new Set();
+
 // Bornes de la file FIFO mémoire (brief : max 1000 événements si le démon
 // est injoignable). Au-delà, perte assumée + log dans la console worker.
 const QUEUE_MAX = 1000;
@@ -167,6 +173,11 @@ async function connect() {
             "type_native", "scroll_native", "screen_pos",
             "screenshot", "captcha_detect", "record",
             "multiframe", "shadow_dom", "heartbeat", "human_profiles", "allframes_target",
+            // Parité WebBridge (contrat docs/protocol-parity-2026-11-06.md) :
+            // une entrée par commande — le démon refuse par `command_not_supported`
+            // avant envoi si elle manque ici.
+            "snapshot", "tabs_list", "tab_attach", "tab_close", "session_close",
+            "send_keys", "network", "pdf", "upload", "cdp",
           ],
         },
       }));
@@ -439,19 +450,19 @@ function sendResponse(payload) {
 async function dispatchCommand(cmd, params) {
   switch (cmd) {
     case "tabs_create":
-      return cmdTabsCreate(params);
+      return noterOngletCree(await cmdTabsCreate(params), params);
     case "goto":
-      return cmdGoto(params);
+      return noterOngletCree(await cmdGoto(params), params);
     case "read":
       return cmdRead(params);
     case "find":
       return cmdFind(params);
     case "click":
-      return cmdClick(params);
+      return cmdClick(await avecSelRefs(params));
     case "fill":
-      return cmdFill(params);
+      return cmdFill(await avecSelRefs(params));
     case "wait":
-      return cmdWait(params);
+      return cmdWait(await avecSelRefs(params));
     case "tab_group":
       return cmdTabGroup(params);
     case "tab_activate":
@@ -476,6 +487,27 @@ async function dispatchCommand(cmd, params) {
       return cmdTypeNative(params);
     case "scroll_native":
       return cmdScrollNative(params);
+    // ── Parité WebBridge (contrat docs/protocol-parity-2026-11-06.md) ──
+    case "snapshot":
+      return cmdSnapshot(params);
+    case "tabs_list":
+      return cmdTabsList(params);
+    case "tab_attach":
+      return cmdTabAttach(params);
+    case "tab_close":
+      return cmdTabClose(params);
+    case "session_close":
+      return cmdSessionClose(params);
+    case "send_keys":
+      return cmdSendKeys(params);
+    case "network":
+      return cmdNetwork(params);
+    case "pdf":
+      return cmdPdf(params);
+    case "upload":
+      return cmdUpload(params);
+    case "cdp":
+      return cmdCdp(params);
     default:
       throw new Error(`commande inconnue: ${cmd}`);
   }
@@ -605,7 +637,7 @@ async function cmdGoto({ tab_id, url }) {
 
 /** Lit un onglet. mode="text" (défaut) → innerText ; mode="outline" →
  *  liste structurée des éléments interactifs visibles (v0.6.1). */
-async function cmdRead({ tab_id, max_bytes, mode }) {
+async function cmdRead({ tab_id, max_bytes, mode, frame, start }) {
   if (tab_id == null) throw new Error("read: 'tab_id' requis");
   if (mode === "outline") {
     const injection = () => {
@@ -672,6 +704,12 @@ async function cmdRead({ tab_id, max_bytes, mode }) {
     return { mode: "outline", elements, frames: (results || []).length };
   }
   const cap = Number.isFinite(max_bytes) ? max_bytes : READ_MAX_BYTES_DEFAULT;
+  // Parité WebBridge (contrat §2) : `frame` (iframe ciblée) et `start`
+  // (continuation) prennent le chemin dédié ci-dessous ; SANS eux, la
+  // concaténation historique de toutes les frames reste INCHANGÉE.
+  if (frame != null || start != null) {
+    return lireEtendu(tab_id, frame, start, cap);
+  }
   const injection = (cap) => {
     const full = document.body ? document.body.innerText : "";
     if (full.length <= cap) return full;
@@ -843,7 +881,11 @@ async function withDebugger(tabId, fn, focus, timeout_ms) {
     } catch (_) { /* fenêtre fermée */ }
   }
   await sleepNat(180); // laisser le rendu de l'activation
-  await chrome.debugger.attach({ tabId }, "1.3");
+  // Session déjà ouverte par une capture réseau (contrat §6) : on la
+  // RÉUTILISE. Sans ça, la première commande qui passe (clic, capture)
+  // volait le debugger et cassait la capture en cours.
+  const sessionPartagee = debuggerPersistant.has(tabId);
+  if (!sessionPartagee) await chrome.debugger.attach({ tabId }, "1.3");
   const cdpMs = Math.min(Math.max(Number(timeout_ms) || 8000, 1000), 20000);
   const dbg = (method, params) => Promise.race([
     chrome.debugger.sendCommand({ tabId }, method, params),
@@ -855,12 +897,15 @@ async function withDebugger(tabId, fn, focus, timeout_ms) {
       setTimeout(() => rej(new Error(`geste natif incomplet (${gesteMs} ms)`)), gesteMs));
     return await Promise.race([fn(dbg), garde]);
   } finally {
-    try {
-      await Promise.race([
-        chrome.debugger.detach({ tabId }),
-        new Promise((r) => setTimeout(r, 1500)),
-      ]);
-    } catch (_) { /* déjà détaché */ }
+    // Session partagée : c'est la capture réseau qui la détachera.
+    if (!sessionPartagee) {
+      try {
+        await Promise.race([
+          chrome.debugger.detach({ tabId }),
+          new Promise((r) => setTimeout(r, 1500)),
+        ]);
+      } catch (_) { /* déjà détaché */ }
+    }
   }
 }
 
@@ -1697,7 +1742,7 @@ async function waitForTabComplete(tab_id) {
  * (Chrome 120+ assouplit parfois) et on propage l'erreur upstream si
  * échec. Le client peut alors passer le bon `tab_id` après `goto`.
  */
-async function cmdScreenshot({ tab_id, format }) {
+async function cmdScreenshot({ tab_id, format, selector, full_page }) {
   const real_tab_id = await resolveTabId(tab_id);
   // Récupère le windowId via tabs.get (nécessaire par captureTabs).
   const tab = await chrome.tabs.get(real_tab_id);
@@ -1725,6 +1770,13 @@ async function cmdScreenshot({ tab_id, format }) {
     await new Promise((r) => setTimeout(r, 200));
   }
   const fmt = format === "jpeg" ? "jpeg" : "png";
+  // Parité WebBridge (contrat §5) : `selector` (capture de l'élément) et
+  // `full_page` (hauteur du document, plafond 20 000 px) passent par CDP.
+  // `path` est IGNORÉ ici : l'extension n'a pas accès au disque, c'est le
+  // démon qui décode le base64 et écrit le fichier.
+  if ((typeof selector === "string" && selector) || full_page === true) {
+    return captureCiblee(real_tab_id, fmt, selector, full_page === true);
+  }
   // Fix 21/10 v1.0.2 : captureVisibleTab exige <all_urls> EFFECTIF (réglage
   // « accès aux sites » que Chrome réinitialise à chaque rechargement ↻) ou
   // activeTab (interaction). Fallback CDP : Page.captureScreenshot via le
@@ -1914,6 +1966,1394 @@ async function cmdCaptchaDetect({ tab_id }) {
     }
   }
   return det;
+}
+
+// ============================================================================
+// PARITÉ WebBridge — contrat docs/protocol-parity-2026-11-06.md (2026-11-06)
+//
+// Commandes ajoutées côté extension SEULE (aucune nouvelle permission) :
+//   snapshot, tabs_list, tab_attach, tab_close, session_close, send_keys,
+//   network, pdf, upload, cdp — plus les extensions de read (§2) et de
+//   screenshot (§5).
+//
+// Trois états vivent ici, tous rattachés à UN onglet et jamais partagés :
+//   - snapshotState : refs @eN et frames #fN du DERNIER snapshot de l'onglet
+//                     (contrat §1 : « un re-snapshot invalide les refs »).
+//   - tabsRegistry  : quels onglets appartiennent à l'automatisation (donc
+//                     fermables) et lesquels sont EMPRUNTÉS (jamais fermés
+//                     par session_close) — contrat §3.
+//   - capturesReseau: tampon borné (200 entrées) de la capture en cours — §6.
+//
+// Les deux premiers survivent à un réveil du service worker via
+// chrome.storage.session (mémoire de session, effacée à la fermeture du
+// navigateur), avec un cache mémoire pour éviter une lecture asynchrone à
+// chaque commande.
+// ============================================================================
+
+// Bornes imposées par le contrat.
+const SNAPSHOT_MAX_CHARS_DEFAULT = 60_000;
+const SNAPSHOT_MAX_NODES = 4000;
+const SNAPSHOT_MAX_VISITES = 20_000;
+const NETWORK_MAX_ENTRIES = 200;
+const NETWORK_BODY_MAX_BYTES = 256 * 1024;
+const SCREENSHOT_FULL_PAGE_MAX_PX = 20_000;
+const SESSION_DEFAUT = "default";
+
+// ── Refs @eN / frames #fN (contrat §1) ──────────────────────────────────
+//
+// DÉCISION : une ref n'est pas un handle DOM (impossible à conserver dans
+// un service worker) mais un CHEMIN CSS calculé pendant le snapshot.
+// click / fill / wait réécrivent donc @eN → ce chemin AVANT d'agir : leur
+// code natif reste intact. Aucun attribut n'est posé sur la page (doctrine
+// du fichier : « le JS prépare, le natif agit » — pas de marqueur
+// d'automatisation repérable par un site).
+const snapshotState = new Map(); // tab_id → {ts, refs: {"@e1": {selector}}, frames}
+
+/** Clé de stockage de session pour l'état de snapshot d'un onglet. */
+function cleSnapshot(tabId) {
+  return "dsh_snapshot_" + tabId;
+}
+
+/** État de snapshot d'un onglet (cache mémoire, puis storage.session). */
+async function chargerSnapshot(tabId) {
+  if (snapshotState.has(tabId)) return snapshotState.get(tabId);
+  try {
+    const cle = cleSnapshot(tabId);
+    const lu = await chrome.storage.session.get(cle);
+    const etat = lu ? lu[cle] : null;
+    if (etat && etat.refs) {
+      snapshotState.set(tabId, etat);
+      return etat;
+    }
+  } catch (e) {
+    log("snapshot: lecture storage.session impossible :", e && e.message);
+  }
+  return null;
+}
+
+/** Remplace la génération de refs de l'onglet (1 snapshot = 1 génération). */
+async function enregistrerSnapshot(tabId, etat) {
+  snapshotState.set(tabId, etat);
+  try {
+    const charge = {};
+    charge[cleSnapshot(tabId)] = etat;
+    await chrome.storage.session.set(charge);
+  } catch (e) {
+    log("snapshot: écriture storage.session impossible (cache mémoire seul) :", e && e.message);
+  }
+}
+
+/** Traduit une ref @eN en sélecteur CSS ; renvoie tout le reste tel quel.
+ *  Une ref inconnue lève « sélecteur introuvable: … » → 404 côté démon
+ *  (contrat, règles communes). */
+async function resoudreRef(tabId, selector) {
+  if (typeof selector !== "string" || !selector.startsWith("@e")) return selector;
+  const etat = await chargerSnapshot(tabId);
+  const entree = etat && etat.refs ? etat.refs[selector] : null;
+  if (!entree || !entree.selector) {
+    throw new Error("sélecteur introuvable: " + selector + " (ref inconnue ou périmée — relancer snapshot)");
+  }
+  return entree.selector;
+}
+
+/** Normalise params.selector d'une commande HISTORIQUE (click/fill/wait)
+ *  quand il porte une ref @eN. Sans ref, params est renvoyé TEL QUEL :
+ *  aucun comportement existant n'est modifié. */
+async function avecSelRefs(params) {
+  if (!params || typeof params.selector !== "string" || !params.selector.startsWith("@e")) {
+    return params;
+  }
+  const id = await resolveTabId(params.tab_id);
+  return { ...params, selector: await resoudreRef(id, params.selector) };
+}
+
+/**
+ * snapshot — arbre d'accessibilité construit depuis le DOM (contrat §1).
+ *
+ * Params : {tab_id?, max_chars?, ref?, cursor?}. max_chars borne le JSON
+ * sérialisé ; cursor (notre ajout, pour consommer next_cursor) reprend la
+ * fenêtre précédente. ref → sous-arbre, et les refs sont renumérotées :
+ * un sous-arbre est un NOUVEAU snapshot, donc une nouvelle génération.
+ *
+ * Retour : {url, title, tree:[{ref, role, name, level?}], truncated,
+ *           next_cursor, frames:[{id, index, selector, src, name, accessible}]}.
+ *
+ * DÉCISIONS : arbre PLAT (forme de l'exemple du contrat) ; seuls les nœuds
+ * visibles ET nommés sont émis ; light DOM seulement (un chemin CSS à
+ * travers un shadow root ne serait pas résolvable par click/fill) ; les
+ * iframes ne sont pas fusionnées dans l'arbre, elles sont listées à part
+ * dans frames (index → sélecteur), comme le demande le contrat §2.
+ */
+async function cmdSnapshot({ tab_id, max_chars, ref, cursor }) {
+  const id = await resolveTabId(tab_id);
+  const cap = Number(max_chars) > 0
+    ? Math.min(Math.floor(Number(max_chars)), 500_000)
+    : SNAPSHOT_MAX_CHARS_DEFAULT;
+  const depuis = Math.max(0, Math.floor(Number(cursor) || 0));
+  let racine = null;
+  if (ref != null && String(ref).trim() !== "") {
+    const demande = String(ref).trim();
+    if (!demande.startsWith("@e")) {
+      throw new Error("sélecteur introuvable: " + demande + " (ref attendue : @eN)");
+    }
+    racine = await resoudreRef(id, demande);
+  }
+  const injection = (racineSel, maxNodes, maxVisites) => {
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    // Balises sans rôle ni contenu utile : on ne descend pas dedans.
+    const IGNORES = {
+      script: 1, style: 1, noscript: 1, template: 1, head: 1, meta: 1, link: 1,
+      title: 1, base: 1, iframe: 1, frame: 1, frameset: 1, object: 1, embed: 1,
+      source: 1, track: 1, param: 1,
+    };
+    // Rôles de CONTENEUR : leur nom accessible ne peut pas être leur texte
+    // visible (sinon le nom d'une navigation = tout son menu).
+    const SANS_TEXTE = {
+      navigation: 1, main: 1, banner: 1, contentinfo: 1, complementary: 1,
+      form: 1, region: 1, article: 1, list: 1, rowgroup: 1, table: 1,
+      group: 1, dialog: 1, listbox: 1, menu: 1, menubar: 1, tablist: 1,
+      toolbar: 1, tree: 1, grid: 1,
+    };
+    const roleImplicite = (el, tag) => {
+      const type = String(el.getAttribute("type") || "text").toLowerCase();
+      switch (tag) {
+        case "a":
+        case "area":
+          return el.hasAttribute("href") ? "link" : null;
+        case "button":
+        case "summary":
+          return "button";
+        case "input":
+          if (type === "hidden") return null;
+          if (type === "checkbox") return "checkbox";
+          if (type === "radio") return "radio";
+          if (type === "range") return "slider";
+          if (type === "number") return "spinbutton";
+          if (type === "search") return "searchbox";
+          if (type === "email" || type === "tel" || type === "url" ||
+              type === "text" || type === "password") return "textbox";
+          return "button";
+        case "select":
+          return el.multiple || el.size > 1 ? "listbox" : "combobox";
+        case "textarea":
+          return "textbox";
+        case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
+          return "heading";
+        case "ul": case "ol": case "menu":
+          return "list";
+        case "li":
+          return "listitem";
+        case "nav":
+          return "navigation";
+        case "main":
+          return "main";
+        case "header":
+          return "banner";
+        case "footer":
+          return "contentinfo";
+        case "aside":
+          return "complementary";
+        case "form":
+          return "form";
+        case "article":
+          return "article";
+        case "section":
+          return el.hasAttribute("aria-label") || el.hasAttribute("aria-labelledby") ? "region" : null;
+        case "table":
+          return "table";
+        case "thead": case "tbody": case "tfoot":
+          return "rowgroup";
+        case "tr":
+          return "row";
+        case "td":
+          return "cell";
+        case "th":
+          return "columnheader";
+        case "caption":
+          return "caption";
+        case "img":
+          return el.hasAttribute("alt") ? "img" : null;
+        case "dialog":
+          return "dialog";
+        case "details":
+        case "fieldset":
+          return "group";
+        case "progress":
+          return "progressbar";
+        case "option":
+          return "option";
+        case "optgroup":
+          return "group";
+        default:
+          return null;
+      }
+    };
+    const niveau = (el, role, tag, listes) => {
+      const aria = parseInt(el.getAttribute("aria-level"), 10);
+      if (Number.isFinite(aria) && aria > 0) return aria;
+      if (role === "heading") {
+        const m = /^h([1-6])$/.exec(tag);
+        return m ? parseInt(m[1], 10) : 2;
+      }
+      if (role === "list") return listes + 1;
+      if (role === "listitem") return Math.max(1, listes);
+      return null;
+    };
+    const nomDe = (el, role, tag) => {
+      const borne = (s) => s.slice(0, 200);
+      const aria = norm(el.getAttribute("aria-label"));
+      if (aria) return borne(aria);
+      const labelledby = norm(el.getAttribute("aria-labelledby"));
+      if (labelledby) {
+        const texte = norm(labelledby.split(" ").map((rid) => {
+          const noeud = document.getElementById(rid);
+          return noeud ? (noeud.innerText || noeud.textContent || "") : "";
+        }).join(" "));
+        if (texte) return borne(texte);
+      }
+      if (tag === "img" || tag === "area") {
+        const alt = norm(el.getAttribute("alt"));
+        if (alt) return borne(alt);
+      }
+      const type = String(el.getAttribute("type") || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") {
+        const placeholder = norm(el.getAttribute("placeholder"));
+        if (placeholder) return borne(placeholder);
+        const etiquette = el.labels && el.labels.length ? norm(el.labels[0].textContent || "") : "";
+        if (etiquette) return borne(etiquette);
+        const titreChamp = norm(el.getAttribute("title"));
+        if (titreChamp) return borne(titreChamp);
+        // Jamais la valeur d'un champ sensible dans l'arbre.
+        if (type === "password") return "";
+        if (typeof el.value === "string" && el.value.trim()) return borne(norm(el.value));
+        return "";
+      }
+      if (SANS_TEXTE[role]) {
+        const titre = norm(el.getAttribute("title"));
+        return titre ? borne(titre) : "";
+      }
+      const texte = norm(el.innerText || el.textContent || "");
+      if (texte) return borne(texte);
+      const titre = norm(el.getAttribute("title"));
+      return titre ? borne(titre) : "";
+    };
+    // Visibilité RÉELLE (display:none hérité, visibility, aria-hidden).
+    const visible = (el) => {
+      try {
+        if (typeof el.checkVisibility === "function") {
+          return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+        }
+      } catch (_) { /* API absente : repli ci-dessous */ }
+      const st = getComputedStyle(el);
+      if (st.display === "none" || st.visibility === "hidden" || st.visibility === "collapse") {
+        return false;
+      }
+      return el.getClientRects().length > 0;
+    };
+    // Chemin CSS résolvable par document.querySelector : ancré sur le
+    // premier id simple rencontré, sinon tag + :nth-of-type.
+    const chemin = (el) => {
+      const morceaux = [];
+      let courant = el;
+      let garde = 0;
+      while (courant && courant.nodeType === 1 && garde < 8) {
+        const id = courant.getAttribute("id") || "";
+        if (id && /^[A-Za-z][A-Za-z0-9_-]*$/.test(id)) {
+          morceaux.unshift("#" + id);
+          return morceaux.join(" > ");
+        }
+        let sel = courant.tagName.toLowerCase();
+        const parent = courant.parentElement;
+        if (parent) {
+          const freres = parent.children;
+          let rang = 0;
+          let total = 0;
+          for (let i = 0; i < freres.length; i++) {
+            if (freres[i].tagName === courant.tagName) {
+              total += 1;
+              if (freres[i] === courant) rang = total;
+            }
+          }
+          if (total > 1) sel += ":nth-of-type(" + rang + ")";
+        }
+        morceaux.unshift(sel);
+        courant = parent;
+        garde += 1;
+      }
+      return morceaux.join(" > ");
+    };
+    const noeuds = [];
+    let visites = 0;
+    let coupe = false;
+    const parcourir = (el, listes, ariaCache) => {
+      if (!el || coupe || el.nodeType !== 1) return;
+      if (noeuds.length >= maxNodes || visites >= maxVisites) {
+        coupe = true;
+        return;
+      }
+      const tag = el.tagName.toLowerCase();
+      if (IGNORES[tag]) return;
+      const ariaHidden = ariaCache || el.getAttribute("aria-hidden") === "true";
+      if (ariaHidden) return; // sous-arbre hors arbre d'accessibilité
+      visites += 1;
+      if (!visible(el)) return;
+      const roleBrut = norm(el.getAttribute("role")).split(" ")[0].toLowerCase();
+      const role = roleBrut === "presentation" || roleBrut === "none"
+        ? null
+        : (roleBrut || roleImplicite(el, tag));
+      let listesEnfants = listes;
+      if (role) {
+        const nom = nomDe(el, role, tag);
+        if (nom) {
+          noeuds.push({
+            ref: "@e" + (noeuds.length + 1),
+            role: role,
+            name: nom,
+            level: niveau(el, role, tag, listes),
+            selector: chemin(el),
+          });
+        }
+        if (role === "list") listesEnfants = listes + 1;
+      }
+      for (let i = 0; i < el.children.length && !coupe; i++) {
+        parcourir(el.children[i], listesEnfants, ariaHidden);
+      }
+    };
+    const depart = racineSel
+      ? document.querySelector(racineSel)
+      : (document.body || document.documentElement);
+    if (!depart) {
+      return { introuvable: true, url: location.href, title: document.title || "" };
+    }
+    parcourir(depart, 0, false);
+    // Iframes accessibles du document principal (contrat §2 : index → handle).
+    const frames = [];
+    try {
+      const liste = document.querySelectorAll("iframe, frame");
+      for (let i = 0; i < liste.length; i++) {
+        const el = liste[i];
+        let accessible = false;
+        try { accessible = !!el.contentDocument; } catch (_) { accessible = false; }
+        frames.push({
+          id: "#f" + (i + 1),
+          index: i + 1,
+          selector: chemin(el),
+          src: el.getAttribute("src") || "",
+          name: norm(el.getAttribute("name") || el.getAttribute("title") || ""),
+          accessible: accessible,
+        });
+      }
+    } catch (_) { /* document sans iframe : liste vide */ }
+    return {
+      url: location.href,
+      title: document.title || "",
+      nodes: noeuds,
+      frames: frames,
+      truncated: coupe,
+    };
+  };
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: injection,
+    args: [racine, SNAPSHOT_MAX_NODES, SNAPSHOT_MAX_VISITES],
+  });
+  const brut = res && res.result;
+  if (!brut) throw new Error("snapshot: executeScript n'a rien renvoyé");
+  if (brut.introuvable) {
+    throw new Error("sélecteur introuvable: " + racine + " (arbre modifié depuis le snapshot)");
+  }
+  const noeuds = Array.isArray(brut.nodes) ? brut.nodes : [];
+  const refs = {};
+  for (const n of noeuds) {
+    if (n && n.ref && n.selector) refs[n.ref] = { selector: n.selector };
+  }
+  const total = noeuds.length;
+  const debut = Math.min(depuis, total);
+  const arbre = [];
+  let utilise = 0;
+  let coupe = brut.truncated === true;
+  let i = debut;
+  for (; i < total; i++) {
+    const n = noeuds[i];
+    const rendu = { ref: n.ref, role: n.role, name: n.name };
+    if (n.level != null) rendu.level = n.level;
+    const taille = JSON.stringify(rendu).length + 1;
+    if (utilise + taille > cap) {
+      coupe = true;
+      break;
+    }
+    utilise += taille;
+    arbre.push(rendu);
+  }
+  const suivant = i < total ? String(i) : null;
+  await enregistrerSnapshot(id, {
+    ts: Date.now(),
+    refs: refs,
+    frames: Array.isArray(brut.frames) ? brut.frames : [],
+  });
+  return {
+    url: brut.url || "",
+    title: brut.title || "",
+    tree: arbre,
+    truncated: coupe,
+    next_cursor: suivant,
+    frames: Array.isArray(brut.frames) ? brut.frames : [],
+  };
+}
+
+/**
+ * read étendu (contrat §2) : iframe ciblée (#fN ou sélecteur CSS) et/ou
+ * continuation (start). Retour {text, complete, next_start, frame}.
+ *
+ * Le chemin historique de cmdRead (concaténation de toutes les frames)
+ * n'est utilisé que si NI frame NI start ne sont fournis : zéro régression.
+ * Sans frame mais AVEC start, on pagine le DOCUMENT PRINCIPAL (le seul dont
+ * les offsets restent stables d'un appel au suivant).
+ */
+async function lireEtendu(tabId, frame, start, cap) {
+  const offset = Math.max(0, Math.floor(Number(start) || 0));
+  const demande = frame != null ? String(frame).trim() : "";
+  let selFrame = null;
+  if (demande) {
+    if (demande.startsWith("#f")) {
+      const etat = await chargerSnapshot(tabId);
+      const liste = etat && Array.isArray(etat.frames) ? etat.frames : [];
+      const entree = liste.find((f) => f && f.id === demande);
+      if (!entree) {
+        throw new Error("sélecteur introuvable: " + demande + " (frame inconnue — relancer snapshot)");
+      }
+      if (entree.accessible === false) {
+        throw new Error("read: frame " + demande + " inaccessible depuis l'extension (cross-origin)");
+      }
+      selFrame = entree.selector;
+    } else {
+      selFrame = demande;
+    }
+  }
+  const injection = (sel, off, limite) => {
+    if (sel) {
+      // La bonne frame est celle dont frameElement correspond au sélecteur.
+      // Une frame cross-origin n'a pas de frameElement : elle ne matchera
+      // jamais, d'où l'erreur « sélecteur introuvable » explicite en sortie.
+      const fe = window.frameElement;
+      if (!fe) return null;
+      let correspond = false;
+      try { correspond = fe.matches(sel); } catch (_) { correspond = false; }
+      if (!correspond) return null;
+    } else if (window !== window.top) {
+      return null; // sans frame : document principal uniquement
+    }
+    const plein = document.body ? document.body.innerText : "";
+    const texte = plein.slice(off, off + limite);
+    const suite = off + texte.length;
+    return {
+      text: texte,
+      complete: suite >= plein.length,
+      next_start: suite >= plein.length ? null : suite,
+      length: plein.length,
+      href: location.href,
+    };
+  };
+  const results = await chrome.scripting.executeScript({
+    target: selFrame ? { tabId: tabId, allFrames: true } : { tabId: tabId },
+    func: injection,
+    args: [selFrame, offset, cap],
+  });
+  let cible = null;
+  for (const r of results || []) {
+    if (r && r.result && typeof r.result.text === "string") {
+      cible = r.result;
+      break;
+    }
+  }
+  if (!cible) {
+    if (selFrame) throw new Error("sélecteur introuvable: " + (demande || selFrame));
+    throw new Error("read: executeScript n'a rien renvoyé");
+  }
+  return {
+    text: cible.text,
+    complete: cible.complete === true,
+    next_start: cible.complete === true ? null : cible.next_start,
+    frame: demande || null,
+  };
+}
+
+// ── Cycle de vie des onglets et des sessions (contrat §3) ──────────────
+//
+// DÉCISION : un onglet n'est fermable que s'il a été CRÉÉ par
+// l'automatisation. tab_attach sur un onglet préexistant (celui que
+// l'utilisateur avait ouvert) le marque EMPRUNTÉ : il devient l'onglet
+// courant de la tâche, mais session_close ne le ferme JAMAIS. Un onglet
+// absent du registre est traité comme emprunté (défaut sûr).
+// La propriété est COLLANTE : un onglet créé par nous ne redevient jamais
+// emprunté par simple réutilisation.
+const tabsRegistry = new Map(); // tab_id → {session, borrowed, created_by, ts}
+const CLE_REGISTRE = "dsh_tabs_registry";
+let registreCharge = false;
+
+async function chargerRegistre() {
+  if (registreCharge) return tabsRegistry;
+  registreCharge = true;
+  try {
+    const lu = await chrome.storage.session.get(CLE_REGISTRE);
+    const liste = lu && Array.isArray(lu[CLE_REGISTRE]) ? lu[CLE_REGISTRE] : [];
+    for (const e of liste) {
+      if (e && typeof e.tab_id === "number") tabsRegistry.set(e.tab_id, e);
+    }
+  } catch (e) {
+    log("onglets: lecture du registre impossible :", e && e.message);
+  }
+  return tabsRegistry;
+}
+
+async function sauverRegistre() {
+  try {
+    const charge = {};
+    charge[CLE_REGISTRE] = [...tabsRegistry.values()];
+    await chrome.storage.session.set(charge);
+  } catch (e) {
+    log("onglets: écriture du registre impossible :", e && e.message);
+  }
+}
+
+/** Enregistre (ou met à jour) un onglet dans le registre de propriété. */
+async function marquerOnglet(tabId, options) {
+  const choix = options || {};
+  const registre = await chargerRegistre();
+  const ancien = registre.get(tabId) || {};
+  const dejaPossede = ancien.borrowed === false;
+  const session = (typeof choix.session === "string" && choix.session.trim())
+    ? choix.session.trim()
+    : (ancien.session || SESSION_DEFAUT);
+  const entree = {
+    tab_id: tabId,
+    session: session,
+    borrowed: dejaPossede ? false : choix.borrowed === true,
+    created_by: choix.created_by || ancien.created_by || null,
+    ts: Date.now(),
+  };
+  registre.set(tabId, entree);
+  await sauverRegistre();
+  return entree;
+}
+
+/** tabs_create / goto : note la propriété de l'onglet renvoyé.
+ *  reused === false → créé par nous (fermable) ; reused === true → il
+ *  préexistait (emprunté) ; reused absent (goto sur un tab_id fourni) →
+ *  on ne touche pas au registre : l'onglet reste ce qu'il était. */
+async function noterOngletCree(resultat, params) {
+  if (!resultat || typeof resultat.tab_id !== "number" || resultat.reused === undefined) {
+    return resultat;
+  }
+  await marquerOnglet(resultat.tab_id, {
+    session: params && typeof params.session === "string" ? params.session : null,
+    borrowed: resultat.reused === true,
+    created_by: "tabs_create",
+  });
+  return resultat;
+}
+
+/** tabs_list — onglets de la fenêtre courante (ou de toutes avec
+ *  all_windows). borrowed : onglet préexistant, jamais fermé par
+ *  session_close ; owned : créé par l'automatisation. */
+async function cmdTabsList({ all_windows }) {
+  const registre = await chargerRegistre();
+  const onglets = await chrome.tabs.query(all_windows === true ? {} : { currentWindow: true });
+  const titresGroupes = new Map();
+  const liste = [];
+  for (const t of onglets) {
+    const reg = registre.get(t.id);
+    const entree = {
+      tab_id: t.id,
+      window_id: t.windowId,
+      url: t.url || t.pendingUrl || "",
+      title: t.title || "",
+      active: t.active === true,
+      borrowed: !(reg && reg.borrowed === false),
+      owned: !!(reg && reg.borrowed === false),
+    };
+    if (reg && reg.session) entree.session = reg.session;
+    const gid = typeof t.groupId === "number" ? t.groupId : -1;
+    if (gid >= 0) {
+      if (!titresGroupes.has(gid)) {
+        let titre = "";
+        try {
+          const groupe = await chrome.tabGroups.get(gid);
+          titre = (groupe && groupe.title) || "";
+        } catch (_) { titre = ""; }
+        titresGroupes.set(gid, titre);
+      }
+      const titreGroupe = titresGroupes.get(gid);
+      if (titreGroupe) entree.group_title = titreGroupe;
+    }
+    liste.push(entree);
+  }
+  return { tabs: liste, count: liste.length, all_windows: all_windows === true };
+}
+
+/** tab_attach — l'onglet devient l'onglet courant de la tâche. */
+async function cmdTabAttach({ tab_id, session }) {
+  if (tab_id == null) throw new Error("tab_attach: 'tab_id' (entier) requis");
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tab_id);
+  } catch (e) {
+    throw new Error("tab_attach: onglet introuvable: " + tab_id);
+  }
+  const registre = await chargerRegistre();
+  const ancien = registre.get(tab_id);
+  // Créé par nous → reste à nous ; préexistant → EMPRUNTÉ (jamais fermé).
+  const entree = await marquerOnglet(tab_id, {
+    session: typeof session === "string" ? session : null,
+    borrowed: !(ancien && ancien.borrowed === false),
+    created_by: "tab_attach",
+  });
+  await chrome.tabs.update(tab_id, { active: true });
+  return {
+    tab_id: tab_id,
+    url: tab.url || "",
+    title: tab.title || "",
+    borrowed: entree.borrowed === true,
+    owned: entree.borrowed === false,
+    session: entree.session,
+    window_id: tab.windowId,
+  };
+}
+
+/** tab_close — fermeture explicite d'UN onglet, emprunté ou non : c'est le
+ *  client qui le demande nommément, on ne devine pas à sa place. */
+async function cmdTabClose({ tab_id }) {
+  if (tab_id == null) throw new Error("tab_close: 'tab_id' (entier) requis");
+  const registre = await chargerRegistre();
+  try {
+    await chrome.tabs.remove(tab_id);
+  } catch (e) {
+    throw new Error("tab_close: fermeture impossible (onglet introuvable ou déjà fermé): " + (e && e.message));
+  }
+  if (registre.delete(tab_id)) await sauverRegistre();
+  return { closed: 1 };
+}
+
+/** session_close — ferme les onglets OUVERTS PAR l'automatisation.
+ *  DÉCISION : le démon est mono-tenant ; un nom de session inconnu du
+ *  registre est traité comme un simple libellé et on ferme alors la session
+ *  "default" (où vivent les onglets créés sans nom). Les onglets EMPRUNTÉS
+ *  ne sont jamais fermés, quel que soit le nom demandé. */
+async function cmdSessionClose({ session }) {
+  const registre = await chargerRegistre();
+  const nom = typeof session === "string" && session.trim() ? session.trim() : "";
+  const possedes = [...registre.entries()].filter(([, r]) => r && r.borrowed === false);
+  const nomConnu = nom !== "" && possedes.some(([, r]) => r.session === nom);
+  const cibles = possedes
+    .filter(([, r]) => !nom || r.session === nom || !nomConnu)
+    .map(([id]) => id);
+  const vivants = [];
+  for (const id of cibles) {
+    try {
+      await chrome.tabs.get(id);
+      vivants.push(id);
+    } catch (_) {
+      registre.delete(id); // déjà fermé à la main : rien à fermer
+    }
+  }
+  let fermes = 0;
+  if (vivants.length > 0) {
+    try {
+      await chrome.tabs.remove(vivants);
+      fermes = vivants.length;
+    } catch (e) {
+      for (const id of vivants) {
+        try {
+          await chrome.tabs.remove(id);
+          fermes += 1;
+        } catch (_) { /* déjà fermé */ }
+      }
+    }
+    for (const id of vivants) registre.delete(id);
+  }
+  await sauverRegistre();
+  const empruntes = [...registre.values()].filter((r) => r && r.borrowed === true).length;
+  return { closed: fermes, session: nom || null, kept_borrowed: empruntes };
+}
+
+/** Capture CDP d'un élément ou de la page entière (contrat §5).
+ *  Le démon écrit le fichier à partir du base64 : l'extension n'a jamais
+ *  accès au disque, donc path n'est même pas un paramètre ici. */
+async function captureCiblee(tabId, fmt, selector, fullPage) {
+  let clip = null;
+  if (typeof selector === "string" && selector) {
+    const sel = await resoudreRef(tabId, selector);
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: (s) => {
+        const el = document.querySelector(s);
+        if (!el) return null;
+        try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) {}
+        const r = el.getBoundingClientRect();
+        return {
+          x: r.x + window.scrollX,
+          y: r.y + window.scrollY,
+          width: r.width,
+          height: r.height,
+        };
+      },
+      args: [sel],
+    });
+    const rect = res && res.result;
+    if (!rect) throw new Error("sélecteur introuvable: " + sel);
+    if (!(rect.width > 0) || !(rect.height > 0)) {
+      throw new Error("screenshot: élément de taille nulle (invisible ?): " + sel);
+    }
+    clip = {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: Math.min(rect.height, SCREENSHOT_FULL_PAGE_MAX_PX),
+      scale: 1,
+    };
+  }
+  return withDebugger(tabId, async (dbg) => {
+    const params = { format: fmt, captureBeyondViewport: true };
+    if (fmt === "jpeg") params.quality = 85;
+    if (clip) {
+      params.clip = clip;
+    } else if (fullPage) {
+      const metriques = await dbg("Page.getLayoutMetrics", {});
+      const taille = (metriques && (metriques.cssContentSize || metriques.contentSize)) || {};
+      const largeur = Math.max(1, Math.ceil(Number(taille.width) || 0));
+      const hauteur = Math.min(
+        Math.max(1, Math.ceil(Number(taille.height) || 0)),
+        SCREENSHOT_FULL_PAGE_MAX_PX,
+      );
+      params.clip = { x: 0, y: 0, width: largeur, height: hauteur, scale: 1 };
+    }
+    const rep = await dbg("Page.captureScreenshot", params);
+    if (!rep || typeof rep.data !== "string" || !rep.data) {
+      throw new Error("screenshot: Page.captureScreenshot n'a rien renvoyé");
+    }
+    return { format: fmt, data_url: "data:image/" + fmt + ";base64," + rep.data };
+  }, false, 15000);
+}
+
+// ── send_keys : clavier natif (contrat §4) ─────────────────────────────
+//
+// Une combinaison est envoyée via Input.dispatchKeyEvent (isTrusted=true) :
+// keyDown/rawKeyDown puis keyUp, avec le bitmask de modificateurs CDP
+// (1=Alt, 2=Ctrl, 4=Meta, 8=Shift). Mod = Ctrl hors macOS (contrat §4).
+// Le résultat n'est PAS cru sur parole : l'état de page (URL, focus, valeur,
+// sélection, DOM, scroll) est comparé avant/après → verified.
+
+/** Système hôte, vu du service worker (pas d'API dédiée : userAgent). */
+function osCourant() {
+  let ua = "";
+  try { ua = navigator.userAgent || ""; } catch (_) { ua = ""; }
+  if (/Windows/i.test(ua)) return "windows";
+  if (/Mac OS X|Macintosh|iPhone|iPad/i.test(ua)) return "macos";
+  return "linux";
+}
+
+/** Touches nommées → {key, code, vk, text?} (jeu minimal du contrat). */
+const TOUCHES_CDP = {
+  enter: { key: "Enter", code: "Enter", vk: 13 },
+  return: { key: "Enter", code: "Enter", vk: 13 },
+  escape: { key: "Escape", code: "Escape", vk: 27 },
+  esc: { key: "Escape", code: "Escape", vk: 27 },
+  tab: { key: "Tab", code: "Tab", vk: 9 },
+  backspace: { key: "Backspace", code: "Backspace", vk: 8 },
+  delete: { key: "Delete", code: "Delete", vk: 46 },
+  space: { key: " ", code: "Space", vk: 32, text: " " },
+  arrowup: { key: "ArrowUp", code: "ArrowUp", vk: 38 },
+  arrowdown: { key: "ArrowDown", code: "ArrowDown", vk: 40 },
+  arrowleft: { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
+  arrowright: { key: "ArrowRight", code: "ArrowRight", vk: 39 },
+  home: { key: "Home", code: "Home", vk: 36 },
+  end: { key: "End", code: "End", vk: 35 },
+  pageup: { key: "PageUp", code: "PageUp", vk: 33 },
+  pagedown: { key: "PageDown", code: "PageDown", vk: 34 },
+  insert: { key: "Insert", code: "Insert", vk: 45 },
+  f1: { key: "F1", code: "F1", vk: 112 },
+  f2: { key: "F2", code: "F2", vk: 113 },
+  f3: { key: "F3", code: "F3", vk: 114 },
+  f4: { key: "F4", code: "F4", vk: 115 },
+  f5: { key: "F5", code: "F5", vk: 116 },
+  f6: { key: "F6", code: "F6", vk: 117 },
+  f7: { key: "F7", code: "F7", vk: 118 },
+  f8: { key: "F8", code: "F8", vk: 119 },
+  f9: { key: "F9", code: "F9", vk: 120 },
+  f10: { key: "F10", code: "F10", vk: 121 },
+  f11: { key: "F11", code: "F11", vk: 122 },
+  f12: { key: "F12", code: "F12", vk: 123 },
+};
+
+/** Analyse "Mod+A" / "Shift+Tab" / "Enter" → touche + bitmask CDP. */
+function analyserTouches(keys, os) {
+  const jetons = String(keys).split("+").map((t) => t.trim()).filter(Boolean);
+  if (jetons.length === 0) throw new Error("send_keys: 'keys' vide");
+  const brut = jetons.pop().toLowerCase();
+  let modifiers = 0;
+  for (const modificateur of jetons) {
+    const m = modificateur.toLowerCase();
+    if (m === "mod") {
+      // Mod = Ctrl hors macOS, Cmd sur macOS (contrat §4).
+      modifiers |= os === "macos" ? 4 : 2;
+    } else if (m === "control" || m === "ctrl") {
+      modifiers |= 2;
+    } else if (m === "cmd" || m === "command" || m === "meta") {
+      modifiers |= 4;
+    } else if (m === "alt" || m === "option") {
+      modifiers |= 1;
+    } else if (m === "shift") {
+      modifiers |= 8;
+    } else {
+      throw new Error("send_keys: modificateur inconnu: " + modificateur);
+    }
+  }
+  if (TOUCHES_CDP[brut]) return { ...TOUCHES_CDP[brut], modifiers: modifiers };
+  if (Array.from(brut).length === 1) {
+    const ch = brut;
+    let vk = 0;
+    let code = "";
+    if (ch >= "a" && ch <= "z") {
+      vk = ch.toUpperCase().charCodeAt(0);
+      code = "Key" + ch.toUpperCase();
+    } else if (ch >= "0" && ch <= "9") {
+      vk = ch.charCodeAt(0);
+      code = "Digit" + ch;
+    }
+    // Un raccourci ne PRODUIT pas de texte (Ctrl+A n'écrit pas « a »).
+    const raccourci = (modifiers & 1) !== 0 || (modifiers & 2) !== 0 || (modifiers & 4) !== 0;
+    return { key: ch, code: code, vk: vk, text: raccourci ? "" : ch, modifiers: modifiers };
+  }
+  throw new Error("send_keys: touche non gérée: " + brut);
+}
+
+/** État de page utile pour vérifier qu'un raccourci a eu un effet. */
+async function lireEtatClavier(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: () => {
+        const el = document.activeElement;
+        let selection = 0;
+        try {
+          selection = window.getSelection() ? window.getSelection().toString().length : 0;
+        } catch (_) { selection = 0; }
+        return {
+          url: location.href,
+          active: el ? el.tagName + ":" + String(el.innerText || el.value || "").slice(0, 40) : "",
+          valeur: el && typeof el.value === "string" ? el.value.length : -1,
+          selection: selection,
+          htmlLen: document.body ? document.body.innerHTML.length : 0,
+          scrollY: Math.round(window.scrollY),
+        };
+      },
+    });
+    return res ? res.result : null;
+  } catch (e) {
+    log("send_keys: lecture d'état impossible :", e && e.message);
+    return null;
+  }
+}
+
+/** Vrai si l'état de page a bougé entre deux lectures. */
+function etatClavierChange(avant, apres) {
+  if (!avant || !apres) return false;
+  return avant.url !== apres.url ||
+    avant.active !== apres.active ||
+    avant.valeur !== apres.valeur ||
+    avant.selection !== apres.selection ||
+    avant.htmlLen !== apres.htmlLen ||
+    avant.scrollY !== apres.scrollY;
+}
+
+/** send_keys — {keys, tab_id?, selector?, focus_emulation?, timeout_ms?}.
+ *  focus_emulation : Emulation.setFocusEmulationEnabled activé puis
+ *  TOUJOURS désactivé (finally), pour un onglet en arrière-plan. */
+async function cmdSendKeys({ tab_id, keys, selector, focus_emulation, timeout_ms }) {
+  if (typeof keys !== "string" || !keys.trim()) {
+    throw new Error("send_keys: 'keys' (string) requis");
+  }
+  const os = osCourant();
+  const touche = analyserTouches(keys, os);
+  const id = await resolveTabId(tab_id);
+  if (typeof selector === "string" && selector) {
+    const sel = await resoudreRef(id, selector);
+    // Préparation d'ÉTAT (focus), pas un geste : le natif agit ensuite.
+    const [prep] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: (s) => {
+        const el = document.querySelector(s);
+        if (!el) return null;
+        try { el.scrollIntoView({ block: "center" }); } catch (_) {}
+        try { el.focus(); } catch (_) {}
+        return true;
+      },
+      args: [sel],
+    });
+    if (!prep || !prep.result) throw new Error("sélecteur introuvable: " + sel);
+  }
+  const avant = await lireEtatClavier(id);
+  const rep = await withDebugger(id, async (dbg) => {
+    let emule = false;
+    try {
+      if (focus_emulation === true) {
+        try {
+          await dbg("Emulation.setFocusEmulationEnabled", { enabled: true });
+          emule = true;
+        } catch (e) {
+          log("send_keys: focus emulation indisponible :", e && e.message);
+        }
+      }
+      const base = {
+        key: touche.key,
+        code: touche.code,
+        windowsVirtualKeyCode: touche.vk,
+        nativeVirtualKeyCode: touche.vk,
+        modifiers: touche.modifiers,
+      };
+      if (touche.text) {
+        await dbg("Input.dispatchKeyEvent", { ...base, type: "keyDown", text: touche.text, unmodifiedText: touche.text });
+      } else {
+        await dbg("Input.dispatchKeyEvent", { ...base, type: "rawKeyDown" });
+      }
+      await sleepNat(30 + Math.random() * 40);
+      await dbg("Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+      return { dispatched: true, emule: emule };
+    } finally {
+      if (emule) {
+        try {
+          await dbg("Emulation.setFocusEmulationEnabled", { enabled: false });
+        } catch (_) { /* session détachée */ }
+      }
+    }
+  }, false, timeout_ms);
+  await sleepNat(250);
+  const apres = await lireEtatClavier(id);
+  const reponse = {
+    dispatched: rep.dispatched === true,
+    os: os,
+    keys: keys,
+    verified: etatClavierChange(avant, apres),
+  };
+  if (focus_emulation === true) reponse.focus_emulation = rep.emule === true;
+  return reponse;
+}
+
+// ── network : capture par onglet (contrat §6) ───────────────────────────
+//
+// DÉCISION : la capture tient une session debugger PERSISTANTE sur l'onglet
+// (Network.enable + événements Network.*), parce que les corps de réponse
+// n'existent que par CDP. Cette session est déclarée dans
+// debuggerPersistant : withDebugger la RÉUTILISE au lieu de la voler, donc
+// les clics/captures continuent de fonctionner pendant une capture.
+// Le tampon est borné à 200 entrées, les corps à 256 Ko, et ils sont
+// JETÉS à l'arrêt de la capture (le contrat l'exige).
+const capturesReseau = new Map(); // tab_id → {actif, depuis, entries, vues}
+
+function captureReseau(tabId) {
+  let c = capturesReseau.get(tabId);
+  if (!c) {
+    c = { actif: false, depuis: 0, entries: [], vues: new Map() };
+    capturesReseau.set(tabId, c);
+  }
+  return c;
+}
+
+/** Entrée de list : strictement les 6 champs du contrat. */
+function entreeReseauPublique(e) {
+  return {
+    request_id: e.request_id,
+    url: e.url,
+    method: e.method,
+    status: e.status,
+    mime_type: e.mime_type,
+    completed: e.completed === true,
+  };
+}
+
+/** En-têtes CDP (objet) → [{name, value}] : un nom peut se répéter
+ *  (Set-Cookie), un objet JSON perdrait les doublons. */
+function entetesReseau(entetes) {
+  const out = [];
+  if (!entetes) return out;
+  for (const nom of Object.keys(entetes)) {
+    out.push({ name: nom, value: String(entetes[nom]) });
+  }
+  return out;
+}
+
+/** Tronque un corps à 256 Ko (base64 : multiple de 4 pour rester valide). */
+function bornerCorps(corps, base64) {
+  const s = String(corps == null ? "" : corps);
+  if (s.length <= NETWORK_BODY_MAX_BYTES) return { corps: s, tronque: false };
+  let coupe = s.slice(0, NETWORK_BODY_MAX_BYTES);
+  if (base64 === true) coupe = coupe.slice(0, Math.floor(coupe.length / 4) * 4);
+  return { corps: coupe, tronque: true };
+}
+
+/** Empile une entrée en respectant la borne de 200 (FIFO). */
+function ajouterEntreeReseau(c, entree) {
+  c.entries.push(entree);
+  c.vues.set(entree.request_id, entree);
+  while (c.entries.length > NETWORK_MAX_ENTRIES) {
+    const vieille = c.entries.shift();
+    if (vieille) c.vues.delete(vieille.request_id);
+    log("network: tampon plein (200 entrées), la plus ancienne est perdue");
+  }
+}
+
+async function demarrerCaptureReseau(tabId) {
+  const c = captureReseau(tabId);
+  if (c.actif) {
+    return { tab_id: tabId, capturing: true, started: false, count: c.entries.length };
+  }
+  c.entries = [];
+  c.vues = new Map();
+  try {
+    await chrome.debugger.attach({ tabId: tabId }, "1.3");
+    debuggerPersistant.add(tabId);
+  } catch (e) {
+    debuggerPersistant.delete(tabId);
+    throw new Error("network: attache du debugger impossible (" + (e && e.message) + ")");
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId: tabId }, "Network.enable", {});
+  } catch (e) {
+    debuggerPersistant.delete(tabId);
+    try { await chrome.debugger.detach({ tabId: tabId }); } catch (_) { /* déjà détaché */ }
+    throw new Error("network: Network.enable a échoué (" + (e && e.message) + ")");
+  }
+  c.actif = true;
+  c.depuis = Date.now();
+  return { tab_id: tabId, capturing: true, started: true, max_entries: NETWORK_MAX_ENTRIES };
+}
+
+async function arreterCaptureReseau(tabId) {
+  const c = capturesReseau.get(tabId);
+  if (c) {
+    c.actif = false;
+    for (const e of c.entries) {
+      e.body = null;
+      e.request_body = null;
+      e.body_base64 = false;
+      e.body_truncated = false;
+      if (!e.body_error) e.body_error = "capture arrêtée";
+    }
+  }
+  let detache = false;
+  if (debuggerPersistant.has(tabId)) {
+    debuggerPersistant.delete(tabId);
+    try {
+      await chrome.debugger.detach({ tabId: tabId });
+      detache = true;
+    } catch (_) { /* déjà détaché */ }
+  }
+  return {
+    tab_id: tabId,
+    capturing: false,
+    stopped: true,
+    detached: detache,
+    count: c ? c.entries.length : 0,
+  };
+}
+
+function listerReseau(tabId, filtre) {
+  const c = capturesReseau.get(tabId);
+  if (!c) return { tab_id: tabId, capturing: false, count: 0, requests: [] };
+  const f = typeof filtre === "string" ? filtre : "";
+  const requests = [];
+  for (const e of c.entries) {
+    if (f && !(e.url || "").includes(f)) continue;
+    requests.push(entreeReseauPublique(e));
+  }
+  return { tab_id: tabId, capturing: c.actif === true, count: requests.length, requests: requests };
+}
+
+function detailReseau(tabId, requestId) {
+  if (typeof requestId !== "string" || !requestId) {
+    throw new Error("network: 'request_id' (string) requis pour op=detail");
+  }
+  const c = capturesReseau.get(tabId);
+  const e = c ? c.vues.get(requestId) : null;
+  if (!e) throw new Error("network: request_id inconnu: " + requestId);
+  const out = entreeReseauPublique(e);
+  out.request_headers = e.request_headers || [];
+  out.response_headers = e.response_headers || [];
+  if (e.request_body != null) out.request_body = e.request_body;
+  if (e.error) out.error = e.error;
+  if (e.body != null) out.body = e.body;
+  if (e.body_base64 === true) out.body_base64 = true;
+  if (e.body_truncated === true) out.body_truncated = true;
+  if (out.body == null) out.body_error = e.body_error || "corps indisponible";
+  return out;
+}
+
+/** network — {op: start|stop|list|detail, tab_id?, filter?, request_id?}. */
+async function cmdNetwork({ op, tab_id, filter, request_id }) {
+  const operation = typeof op === "string" ? op.trim().toLowerCase() : "";
+  const id = await resolveTabId(tab_id);
+  switch (operation) {
+    case "start":
+      return demarrerCaptureReseau(id);
+    case "stop":
+      return arreterCaptureReseau(id);
+    case "list":
+      return listerReseau(id, filter);
+    case "detail":
+      return detailReseau(id, request_id);
+    default:
+      throw new Error("network: 'op' inconnu (attendu start|stop|list|detail): " + String(op));
+  }
+}
+
+/** Événements CDP de la capture : métadonnées puis corps des réponses.
+ *  Listener SYNCHRONE enregistré au chargement du worker (exigence MV3) ;
+ *  la récupération du corps est asynchrone et ignorée si la capture
+ *  s'arrête entre-temps. */
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source && typeof source.tabId === "number" ? source.tabId : null;
+  if (tabId == null || !params) return;
+  const c = capturesReseau.get(tabId);
+  if (!c || c.actif !== true) return;
+  if (method === "Network.requestWillBeSent") {
+    const req = params.request || {};
+    const existante = c.vues.get(params.requestId);
+    if (existante) {
+      // Redirection : même request_id, nouvelle URL.
+      existante.url = req.url || existante.url;
+      existante.method = req.method || existante.method;
+      existante.request_headers = entetesReseau(req.headers);
+      return;
+    }
+    const entree = {
+      request_id: params.requestId,
+      url: req.url || "",
+      method: req.method || "",
+      status: null,
+      mime_type: "",
+      completed: false,
+      request_headers: entetesReseau(req.headers),
+      response_headers: [],
+      request_body: null,
+      body: null,
+      body_base64: false,
+      body_error: null,
+      body_truncated: false,
+      error: null,
+    };
+    if (typeof req.postData === "string" && req.postData.length > 0) {
+      entree.request_body = bornerCorps(req.postData, false).corps;
+    }
+    ajouterEntreeReseau(c, entree);
+    return;
+  }
+  if (method === "Network.responseReceived") {
+    const entree = c.vues.get(params.requestId);
+    if (!entree) return;
+    const rep = params.response || {};
+    entree.status = typeof rep.status === "number" ? rep.status : null;
+    entree.mime_type = rep.mimeType || "";
+    entree.response_headers = entetesReseau(rep.headers);
+    return;
+  }
+  if (method === "Network.loadingFinished") {
+    const entree = c.vues.get(params.requestId);
+    if (!entree) return;
+    entree.completed = true;
+    chrome.debugger
+      .sendCommand({ tabId: tabId }, "Network.getResponseBody", { requestId: params.requestId })
+      .then((rep) => {
+        if (!rep || c.actif !== true) return;
+        const base64 = rep.base64Encoded === true;
+        const borne = bornerCorps(rep.body, base64);
+        entree.body = borne.corps;
+        entree.body_base64 = base64;
+        entree.body_truncated = borne.tronque;
+        entree.body_error = null;
+      })
+      .catch((err) => {
+        entree.body_error = "corps indisponible (" + (err && err.message ? err.message : String(err)) + ")";
+      });
+    return;
+  }
+  if (method === "Network.loadingFailed") {
+    const entree = c.vues.get(params.requestId);
+    if (!entree) return;
+    entree.completed = true;
+    entree.error = params.errorText || "échec réseau";
+    if (!entree.body_error) entree.body_error = "requête échouée: " + entree.error;
+  }
+});
+
+/** Détachement subi (onglet fermé, DevTools ouvert, Chrome) : on remet
+ *  l'état à zéro pour que withDebugger réattache normalement. */
+chrome.debugger.onDetach.addListener((source) => {
+  const tabId = source && typeof source.tabId === "number" ? source.tabId : null;
+  if (tabId == null) return;
+  debuggerPersistant.delete(tabId);
+  const c = capturesReseau.get(tabId);
+  if (c) {
+    c.actif = false;
+    for (const e of c.entries) {
+      e.body = null;
+      e.request_body = null;
+    }
+  }
+});
+
+/** Onglet fermé : aucun état fantôme (refs, capture, registre, propriété). */
+chrome.tabs.onRemoved.addListener((tabId) => {
+  snapshotState.delete(tabId);
+  debuggerPersistant.delete(tabId);
+  capturesReseau.delete(tabId);
+  if (tabsRegistry.delete(tabId)) sauverRegistre();
+  try {
+    chrome.storage.session.remove(cleSnapshot(tabId));
+  } catch (_) { /* storage.session indisponible */ }
+});
+
+// ── pdf : export via Page.printToPDF (contrat §7) ──────────────────────
+const FORMATS_PDF = {
+  a3: { paperWidth: 11.7, paperHeight: 16.54 },
+  a4: { paperWidth: 8.27, paperHeight: 11.69 },
+  a5: { paperWidth: 5.83, paperHeight: 8.27 },
+  letter: { paperWidth: 8.5, paperHeight: 11 },
+  legal: { paperWidth: 8.5, paperHeight: 14 },
+  tabloid: { paperWidth: 11, paperHeight: 17 },
+};
+
+/** pdf — {tab_id?, paper_format?, landscape?, scale?, print_background?}.
+ *  Retour {b64, page_title} ; le démon écrit le fichier si path est fourni.
+ *  Budget CDP 18 s (sous le plafond local de 25 s) : un printToPDF de page
+ *  lourde dépasse les 8 s par défaut de withDebugger. */
+async function cmdPdf({ tab_id, paper_format, landscape, scale, print_background }) {
+  const id = await resolveTabId(tab_id);
+  const format = String(paper_format || "a4").trim().toLowerCase();
+  const params = {
+    printBackground: print_background !== false,
+    landscape: landscape === true,
+    displayHeaderFooter: false,
+    scale: Math.min(Math.max(Number(scale) || 1, 0.1), 2),
+  };
+  if (FORMATS_PDF[format]) {
+    params.paperWidth = FORMATS_PDF[format].paperWidth;
+    params.paperHeight = FORMATS_PDF[format].paperHeight;
+  } else if (format !== "auto") {
+    throw new Error("pdf: 'paper_format' non supporté: " + paper_format);
+  }
+  let titre = "";
+  try {
+    const tab = await chrome.tabs.get(id);
+    titre = tab.title || "";
+  } catch (_) { titre = ""; }
+  const b64 = await withDebugger(id, async (dbg) => {
+    const rep = await dbg("Page.printToPDF", params);
+    if (!rep || typeof rep.data !== "string" || !rep.data) {
+      throw new Error("pdf: Page.printToPDF n'a rien renvoyé");
+    }
+    return rep.data;
+  }, false, 18000);
+  return { b64: b64, page_title: titre };
+}
+
+// ── upload : fichier dans un input[type=file] (contrat §8) ─────────────
+/** upload — {tab_id?, selector, files:[chemins absolus]}.
+ *  DOM.setFileInputFiles via debugger. Un chemin relatif est refusé AVANT
+ *  l'appel (Chrome ne peut pas l'ouvrir) ; un chemin illisible côté Chrome
+ *  remonte son erreur. Le retour est VÉRIFIÉ sur l'input après injection
+ *  ({file_count, names} réellement portés), pas sur la demande. */
+async function cmdUpload({ tab_id, selector, files }) {
+  if (typeof selector !== "string" || !selector) {
+    throw new Error("upload: 'selector' (string) requis");
+  }
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error("upload: 'files' (liste de chemins absolus) requis");
+  }
+  const chemins = files.map((f) => String(f).trim()).filter((f) => f.length > 0);
+  if (chemins.length === 0) throw new Error("upload: 'files' vide");
+  const relatif = chemins.find((c) => !c.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(c));
+  if (relatif) {
+    throw new Error("upload: chemin non absolu (illisible depuis Chrome): " + relatif);
+  }
+  const id = await resolveTabId(tab_id);
+  const sel = await resoudreRef(id, selector);
+  const [prep] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: (s) => {
+      const el = document.querySelector(s);
+      if (!el) return null;
+      try { el.scrollIntoView({ block: "center" }); } catch (_) {}
+      try { el.focus(); } catch (_) {}
+      return el.tagName.toLowerCase();
+    },
+    args: [sel],
+  });
+  if (!prep || !prep.result) throw new Error("sélecteur introuvable: " + sel);
+  return withDebugger(id, async (dbg) => {
+    await dbg("DOM.enable", {});
+    const doc = await dbg("DOM.getDocument", { depth: 0 });
+    if (!doc || !doc.root) throw new Error("upload: DOM.getDocument n'a rien renvoyé");
+    const noeud = await dbg("DOM.querySelector", { nodeId: doc.root.nodeId, selector: sel });
+    if (!noeud || !noeud.nodeId) throw new Error("sélecteur introuvable: " + sel);
+    try {
+      await dbg("DOM.setFileInputFiles", { nodeId: noeud.nodeId, files: chemins });
+    } catch (e) {
+      const detail = e && e.message ? e.message : String(e);
+      throw new Error("upload: fichier illisible ou champ non-fichier (" + detail + ")");
+    }
+    const [verif] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: (s) => {
+        const el = document.querySelector(s);
+        if (!el || !el.files) return null;
+        return {
+          file_count: el.files.length,
+          names: Array.from(el.files).map((f) => f.name),
+        };
+      },
+      args: [sel],
+    });
+    const vu = verif && verif.result;
+    return {
+      file_count: vu && typeof vu.file_count === "number" ? vu.file_count : chemins.length,
+      names: vu && Array.isArray(vu.names)
+        ? vu.names
+        : chemins.map((c) => c.split(/[\\/]/).pop()),
+    };
+  }, false, 15000);
+}
+
+// ── cdp : passe-plat debugger sous LISTE BLANCHE (contrat §9) ──────────
+//
+// Page.* sauf Page.navigate (le pilotage de navigation passe par goto),
+// Network.*, DOM.*, Runtime.evaluate, Emulation.*, Accessibility.*.
+// Tout le reste → erreur cdp_method_not_allowed (message exact, 502).
+const METHODES_CDP_AUTORISEES = [
+  /^Page\.(?!navigate$)[A-Za-z][A-Za-z0-9]*$/,
+  /^Network\.[A-Za-z][A-Za-z0-9]*$/,
+  /^DOM\.[A-Za-z][A-Za-z0-9]*$/,
+  /^Runtime\.evaluate$/,
+  /^Emulation\.[A-Za-z][A-Za-z0-9]*$/,
+  /^Accessibility\.[A-Za-z][A-Za-z0-9]*$/,
+];
+
+function methodeCdpAutorisee(methode) {
+  if (typeof methode !== "string" || !methode) return false;
+  return METHODES_CDP_AUTORISEES.some((re) => re.test(methode));
+}
+
+/** cdp — {tab_id?, method, params?, timeout_ms?} → {method, result}. */
+async function cmdCdp({ tab_id, method, params, timeout_ms }) {
+  if (!methodeCdpAutorisee(method)) {
+    throw new Error("cdp_method_not_allowed");
+  }
+  const id = await resolveTabId(tab_id);
+  const retour = await withDebugger(id, async (dbg) => {
+    const args = params && typeof params === "object" && !Array.isArray(params) ? params : {};
+    const rep = await dbg(method, args);
+    return rep === undefined ? null : rep;
+  }, false, timeout_ms);
+  return { method: method, result: retour };
 }
 
 // Démarrage initial : on tente une connexion tout de suite. Si le démon est
