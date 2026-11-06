@@ -1182,10 +1182,43 @@ async function cmdClickNativeRect({ tab_id, x, y, focus, human_profile }) {
  *  observé, ce qui permet au client de ne pas rejouer un clic à l'aveugle. */
 async function clicNatifSurRect(id, rect, libelle, focus, human_profile) {
   const profile = humanProfile(human_profile);
-  const cible = {
+  let cible = {
     x: Math.round(rect.x + (rect.w > 8 ? rect.w * fractionGaussienne() : 0)),
     y: Math.round(rect.y + (rect.h > 8 ? rect.h * fractionGaussienne() : 0)),
   };
+  // v0.6.2 — re-hit-test juste avant le press : la cible a pu bouger entre
+  // la lecture du rect et le geste (montée d'un widget Turnstile qui décale
+  // le formulaire, animation, sticky). Le clic frappait alors l'ancienne
+  // position : « verified » restait vrai (le focus changeait) mais le
+  // handler de la page ne se déclenchait jamais (constat 06/11/2026 sur
+  // explodev.fr : submit register + confirmation newsletter). On relit
+  // l'élément réellement sous le point ; s'il est interactif et que son
+  // centre frais reste dans le rect d'origine, on clique CE centre —
+  // jamais un overlay extérieur au rect (protection contre les bandeaux).
+  const HOTE_ACTIF = ['BUTTON', 'A', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'LABEL', 'SPAN'];
+  try {
+    const [hit] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: (x, y, rectOrig, hotes) => {
+        const el = document.elementFromPoint(x, y);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        const cx = Math.round(r.x + r.width / 2);
+        const cy = Math.round(r.y + r.height / 2);
+        const dansOrig = cx >= rectOrig.x - 6 && cx <= rectOrig.x + rectOrig.w + 6 &&
+                         cy >= rectOrig.y - 6 && cy <= rectOrig.y + rectOrig.h + 6;
+        let interactif = hotes.includes(el.tagName);
+        let p = el.parentElement;
+        for (let i = 0; p && i < 4 && !interactif; i++) { interactif = hotes.includes(p.tagName); p = p.parentElement; }
+        return { tag: el.tagName, centre: { x: cx, y: cy }, dansOrig, interactif };
+      },
+      args: [cible.x, cible.y, { x: rect.x, y: rect.y, w: rect.w, h: rect.h }, HOTE_ACTIF],
+    });
+    const res = hit && hit.result;
+    if (res && res.interactif && res.dansOrig) {
+      cible = res.centre;
+    }
+  } catch (_) { /* hit-test indisponible : on conserve la cible initiale */ }
   const avant = await lireEtatPage(id);
   const rep = await withDebugger(id, async (dbg) => {
     await deplacerCurseur(dbg, id, cible, profile.jitter);
