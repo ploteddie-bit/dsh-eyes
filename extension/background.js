@@ -171,7 +171,7 @@ async function connect() {
             "read", "find", "click", "fill", "eval",
             "click_native", "click_native_text", "click_native_rect",
             "type_native", "scroll_native", "screen_pos",
-            "screenshot", "captcha_detect", "record",
+            "screenshot", "captcha_detect", "captcha_apply", "record",
             "multiframe", "shadow_dom", "heartbeat", "human_profiles", "allframes_target",
             // Parité WebBridge (contrat docs/protocol-parity-2026-11-06.md) :
             // une entrée par commande — le démon refuse par `command_not_supported`
@@ -471,6 +471,8 @@ async function dispatchCommand(cmd, params) {
       return cmdScreenshot(params);
     case "captcha_detect":
       return cmdCaptchaDetect(params);
+    case "captcha_apply":
+      return cmdCaptchaApply(params);
     case "eval":
       return cmdEval(params);
     case "click_native":
@@ -1966,6 +1968,245 @@ async function cmdCaptchaDetect({ tab_id }) {
     }
   }
   return det;
+}
+
+// ── captcha_apply : APPLIQUER une solution fournie (P3, contrat §10) ────
+//
+// Le solveur (captcha_detect + modèle vision côté client) fournit la
+// solution ; cette commande l'EXÉCUTE en gestes natifs (isTrusted=true),
+// sans service tiers et sans nouvelle permission :
+//   - grid   : découpe du conteneur en rows×cols, clic natif au CENTRE de
+//              chaque case demandée ;
+//   - slider : glissement natif press → 15-30 movés → release, avec
+//              vérification que la poignée a bougé ;
+//   - text   : réutilise le chemin de type_native (frappe caractère par
+//              caractère, plan humain) puis vérifie la valeur du champ.
+// Les LECTURES (géométrie, valeur) passent par chrome.scripting ; aucun
+// geste n'est déclenché en JS (doctrine du fichier).
+
+/** Géométrie d'un captcha ramenée dans la viewport TOP, après scroll
+ *  centré. `lireRect` gère déjà toutes les frames, les shadow roots
+ *  ouverts et l'offset d'iframe same-origin ; on ajoute le scroll et la
+ *  taille de viewport (getBoundingClientRect est déjà relative au scroll,
+ *  donc les centres restent des coordonnées CSS viewport). */
+async function rectVisibleCaptcha(id, selector) {
+  await chrome.scripting.executeScript({
+    target: { tabId: id, allFrames: true },
+    func: (sel) => {
+      const deepAll = (s) => {
+        const out = [];
+        const vus = new Set();
+        const walk = (root) => {
+          if (!root || !root.querySelectorAll) return;
+          let matches = [];
+          try { matches = root.querySelectorAll(s); } catch (_) { return; }
+          for (const el of matches) if (!vus.has(el)) { vus.add(el); out.push(el); }
+          for (const el of root.querySelectorAll("*")) if (el.shadowRoot) walk(el.shadowRoot);
+        };
+        walk(document);
+        return out;
+      };
+      const el = deepAll(sel)[0];
+      if (!el) return false;
+      try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {
+        try { el.scrollIntoView(); } catch (_) { /* détaché */ }
+      }
+      return true;
+    },
+    args: [selector],
+  });
+  await sleepNat(120); // scrollIntoView est synchrone ; on laisse le rendu se poser
+  const rect = await lireRect(id, selector);
+  if (!rect) return null;
+  if (rect.cross_origin) {
+    throw new Error("iframe cross-origin non supportée: " + selector);
+  }
+  // Taille de la viewport TOP : seule référence des Input.dispatch*.
+  let vw = 0;
+  let vh = 0;
+  try {
+    const [taille] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: () => ({ vw: window.innerWidth, vh: window.innerHeight }),
+    });
+    if (taille && taille.result) {
+      vw = taille.result.vw;
+      vh = taille.result.vh;
+    }
+  } catch (_) { /* dimension indisponible : pas de contrôle de bord */ }
+  return { ...rect, vw, vh };
+}
+
+/** Valeur courante d'un champ (null si le sélecteur n'existe pas). */
+async function lireValeurChampCaptcha(id, selector) {
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: id },
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      if (typeof el.value === "string") return el.value;
+      return el.innerText || el.textContent || "";
+    },
+    args: [selector],
+  });
+  const v = res ? res.result : null;
+  return typeof v === "string" ? v : null;
+}
+
+/** grid — {selector, cells, rows?, cols?} : un clic natif au centre de
+ *  chaque case. Le rect du conteneur est découpé en rows×cols ; les
+ *  centres restent dans les cases même si l'image est déformée (pas de
+ *  gaussienne : ~50-110 px par case, viser ailleurs risque la voisine). */
+async function appliquerCaptchaGrille(params) {
+  const { tab_id, selector } = params;
+  if (typeof selector !== "string" || !selector) throw new Error("missing_selector");
+  const lignes = params.rows == null ? 3 : Number(params.rows);
+  const colonnes = params.cols == null ? 3 : Number(params.cols);
+  if (!Number.isInteger(lignes) || !Number.isInteger(colonnes) ||
+      lignes < 1 || colonnes < 1 || lignes * colonnes > 100) {
+    throw new Error("invalid_cells");
+  }
+  const cells = params.cells;
+  if (!Array.isArray(cells) || cells.length === 0) throw new Error("invalid_cells");
+  for (const c of cells) {
+    if (!Number.isInteger(c) || c < 0 || c >= lignes * colonnes) {
+      throw new Error("invalid_cells");
+    }
+  }
+  const id = await resolveTabId(tab_id);
+  const rect = await rectVisibleCaptcha(id, selector);
+  if (!rect) throw new Error("sélecteur introuvable: " + selector);
+  const centres = cells.map((i) => ({
+    i,
+    x: Math.round(rect.x + ((i % colonnes) + 0.5) * (rect.w / colonnes)),
+    y: Math.round(rect.y + (Math.floor(i / colonnes) + 0.5) * (rect.h / lignes)),
+  }));
+  if (rect.vw > 0 && rect.vh > 0) {
+    const dehors = centres.find((p) => p.x < 0 || p.y < 0 || p.x >= rect.vw || p.y >= rect.vh);
+    if (dehors) throw new Error("case " + dehors.i + " hors viewport (scroll_native d'abord)");
+  }
+  // Une seule session debugger pour toutes les cases : chaque attachement
+  // coûte 180 ms et fait clignoter le bandeau de debug de Chrome.
+  const budget = Math.min(24000, Math.max(15000, 4000 + centres.length * 1600));
+  const clicked = await withDebugger(id, async (dbg) => {
+    let n = 0;
+    for (const p of centres) {
+      await deplacerCurseur(dbg, id, { x: p.x, y: p.y }, 18);
+      await sleepNat(60 + Math.random() * 90);
+      await dbg("Input.dispatchMouseEvent", { type: "mousePressed", x: p.x, y: p.y, button: "left", clickCount: 1 });
+      await sleepNat(45 + Math.random() * 45);
+      await dbg("Input.dispatchMouseEvent", { type: "mouseReleased", x: p.x, y: p.y, button: "left", clickCount: 1 });
+      await sleepNat(140 + Math.random() * 160);
+      n += 1;
+    }
+    return n;
+  }, false, budget);
+  return {
+    applied: true,
+    kind: "grid",
+    cells: cells.slice(),
+    clicked,
+    rect: {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.w),
+      height: Math.round(rect.h),
+    },
+  };
+}
+
+/** slider — {selector, delta_x} : press, 15-30 mouseMoved intermédiaires
+ *  (progression ease-in-out, jitter vertical ±2 px), release, puis
+ *  vérification du déplacement observé de la poignée (avant/après rect). */
+async function appliquerCaptchaSlider(params) {
+  const { tab_id, selector } = params;
+  if (typeof selector !== "string" || !selector) throw new Error("missing_selector");
+  const deltaBrut = params.delta_x;
+  const delta = Number(deltaBrut);
+  // null/undefined/chaîne vide = paramètre absent (Number(null) vaut 0).
+  if (deltaBrut == null || deltaBrut === "" || !Number.isFinite(delta)) {
+    throw new Error("missing_delta_x");
+  }
+  const dx = Math.round(delta);
+  const id = await resolveTabId(tab_id);
+  const avant = await lireRect(id, selector);
+  if (!avant) throw new Error("sélecteur introuvable: " + selector);
+  if (avant.cross_origin) throw new Error("iframe cross-origin non supportée: " + selector);
+  const depart = {
+    x: Math.round(avant.x + avant.w / 2),
+    y: Math.round(avant.y + avant.h / 2),
+  };
+  const pas = 15 + Math.floor(Math.random() * 16); // 15..30 movés
+  const budget = Math.min(24000, Math.max(15000, 6000 + pas * 60));
+  await withDebugger(id, async (dbg) => {
+    await deplacerCurseur(dbg, id, depart, 24);
+    await sleepNat(80 + Math.random() * 80);
+    await dbg("Input.dispatchMouseEvent", { type: "mousePressed", x: depart.x, y: depart.y, button: "left", clickCount: 1 });
+    await sleepNat(60 + Math.random() * 70);
+    let dernier = { x: depart.x, y: depart.y };
+    for (let k = 1; k <= pas; k++) {
+      const t = k / pas;
+      // Ease-in-out quadratique : amorce douce, milieu rapide, arrivée
+      // freinée — une progression linéaire est une signature robot.
+      const p = t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t);
+      dernier = {
+        x: Math.round(depart.x + dx * p),
+        y: Math.round(depart.y + (Math.random() * 4 - 2)),
+      };
+      await dbg("Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: dernier.x, y: dernier.y, button: "left", buttons: 1,
+      });
+      await sleepNat(12 + Math.random() * 26);
+    }
+    await sleepNat(50 + Math.random() * 80);
+    await dbg("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: dernier.x, y: dernier.y, button: "left", clickCount: 1,
+    });
+  }, false, budget);
+  await sleepNat(250 + Math.random() * 200);
+  const apres = await lireRect(id, selector);
+  const verified = !!apres &&
+    (Math.abs(apres.x - avant.x) >= 1 || Math.abs(apres.y - avant.y) >= 1);
+  return { applied: true, kind: "slider", delta_x: dx, verified };
+}
+
+/** text — {input_selector, text} : focus + select() puis frappe native
+ *  caractère par caractère via le chemin EXACT de type_native (aucune
+ *  duplication de la logique CDP), puis valeur relue pour vérifier. */
+async function appliquerCaptchaTexte(params) {
+  const { tab_id, input_selector, text } = params;
+  if (typeof input_selector !== "string" || !input_selector) {
+    throw new Error("missing_input_selector");
+  }
+  if (typeof text !== "string" || text.length === 0) throw new Error("missing_text");
+  const id = await resolveTabId(tab_id);
+  const avant = await lireValeurChampCaptcha(id, input_selector);
+  if (avant === null) throw new Error("sélecteur introuvable: " + input_selector);
+  await cmdTypeNative({ tab_id: id, selector: input_selector, text });
+  await sleepNat(180 + Math.random() * 120);
+  const apres = await lireValeurChampCaptcha(id, input_selector);
+  return {
+    applied: true,
+    kind: "text",
+    verified: typeof apres === "string" && apres !== avant,
+  };
+}
+
+/** captcha_apply — {tab_id?, kind: "grid"|"slider"|"text", …}.
+ *  Erreurs du contrat §10, sans préfixe : missing_selector, invalid_cells,
+ *  missing_delta_x, missing_input_selector, missing_text, kind_inconnu. */
+async function cmdCaptchaApply(params) {
+  const p = params && typeof params === "object" ? params : {};
+  switch (p.kind) {
+    case "grid":
+      return appliquerCaptchaGrille(p);
+    case "slider":
+      return appliquerCaptchaSlider(p);
+    case "text":
+      return appliquerCaptchaTexte(p);
+    default:
+      throw new Error("kind_inconnu: " + p.kind);
+  }
 }
 
 // ============================================================================
