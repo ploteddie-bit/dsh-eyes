@@ -72,6 +72,37 @@ Supported commands (cf. `extension/background.js`):
 - `screen_pos {tab_id?, selector}` — activates the tab and returns the **screen** geometry of the element (`ecranX/ecranY`) — to be passed to `bin/os-clic.sh`, which moves the **REAL Windows pointer** (SetCursorPos + mouse_event via WSL→PowerShell interop). Exclusive pointer control for ~300 ms; `OS_OFFSET_X/Y` calibration offsets if zoom/DPI is atypical.
 - `wait_for {tab_id?, selector|text, timeout_ms?}` — bounded busy wait (250 ms, max 60 s) for a selector OR a text: replaces the arbitrary sleeps of scripts on slow SPAs.
 
+### Parité WebBridge (2026-11-06)
+
+Commandes ajoutées pour couvrir les écarts de l'audit du 2026-11-06
+(contrat détaillé : `docs/protocol-parity-2026-11-06.md`) :
+
+- `snapshot {tab_id?, max_chars?, ref?}` — arbre d'accessibilité + refs `@eN`
+  (résolues par `click`/`fill`/`wait`), et `frames` des iframes accessibles.
+- `read` étendu — `frame` (`#fN` ou sélecteur CSS) et `start` de continuation ;
+  réponse `{text, complete, next_start, frame}`.
+- Cycle de vie — `tabs_list {all_windows?}`, `tab_attach {tab_id}`,
+  `tab_close {tab_id}`, `session_close {session}` (les onglets préexistants
+  attachés ne sont jamais fermés par la session).
+- `send_keys {tab_id?, keys, focus_emulation?}` — combinaisons (`Enter`,
+  `Mod+A`…), focus émulé pour un onglet en arrière-plan.
+- `screenshot` étendu — `selector`, `full_page` (plafond 20 000 px) ; `path`
+  est traité par le démon (l'extension n'écrit pas sur le disque).
+- `network {op:start|stop|list|detail, tab_id?, filter?, request_id?}` —
+  capture par onglet, buffer 200 entrées, corps bornés à 256 Ko.
+- `pdf {tab_id?, paper_format?, landscape?, scale?, print_background?}` —
+  `Page.printToPDF` ; le démon écrit le fichier si `path` est fourni.
+- `upload {tab_id?, selector, files[]}` — `DOM.setFileInputFiles`.
+- `cdp {tab_id?, method, params?}` — passe-plat avec liste blanche (`Page.*`
+  sauf `navigate`, `Network.*`, `DOM.*`, `Runtime.evaluate`, `Emulation.*`,
+  `Accessibility.*`).
+
+Routes démon correspondantes : `/v2/snapshot`, `/v2/tabs`, `/v2/send_keys`,
+`/v2/network`, `/v2/pdf`, `/v2/upload`, `/v2/cdp`, plus les champs ajoutés à
+`/v2/read` (`frame`, `start`) et `/v2/page/screenshot` (`selector`,
+`full_page`, `path`). Le démon refuse (`command_not_supported`) une commande
+de parité que l'extension n'annonce pas dans son `hello`.
+
 Note v1.0.0 (changes introduced in 0.6.1, now frozen in the major version):
 - Commands are **serialized per tab** (`tab_id`): two concurrent calls on the same tab no longer collide on `chrome.debugger.attach`.
 - `eval` accepts `timeout_ms` (default 8000, bounded 1000-20000 ms); the gesture guard follows at +5 s (max 24 s).
